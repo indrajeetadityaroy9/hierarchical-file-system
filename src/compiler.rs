@@ -26,7 +26,10 @@ use tectonic::{
 };
 use tectonic_bundles::detect_bundle;
 
-use crate::latex::LatexDocument;
+use crate::{
+    document::Document,
+    latex::{LatexDocument, emit_latex},
+};
 
 const FORMAT_VERSION: u32 = 33;
 const BUNDLE_URL: &str = "https://data1b.fullyjustified.net/tlextras-2022.0r0.tar";
@@ -34,6 +37,14 @@ const BUNDLE_DIGEST: &str = "6ffe055852f8faf66c0acbe1a7fb27f87b869a90bad1204f3bf
 const TEX_INPUT_NAME: &str = "mathnote.tex";
 const PDF_OUTPUT_NAME: &str = "mathnote.pdf";
 const CACHE_READY_MARKER: &str = "bundle-v33.ready";
+const CACHE_SCHEMA_VERSION: u32 = 2;
+const CACHE_WARMUP_NOTE: &str = concat!(
+    "$α β γ δ ε ζ η θ ι κ λ μ ν ξ π ρ σ τ υ φ χ ψ ω$\n\n",
+    "$Γ Δ Θ Λ Ξ Π Σ Υ Φ Ψ Ω ϵ ϑ ϖ ϱ$\n\n",
+    "$x over 2$ $root of 81$ $integral of x$ $x times y$\n\n",
+    "$x is less than or equal to y$ $x is greater than or equal to y$\n\n",
+    "$x is not equal to y$ $x plus or minus y$ $infinity$\n",
+);
 
 /// Input for a background-friendly synchronous compile operation.
 #[derive(Debug, Clone)]
@@ -57,23 +68,10 @@ impl CompileRequest {
     }
 }
 
-/// Optional controls for the compiler.
 #[derive(Debug, Clone)]
-pub struct CompileOptions {
-    /// Use this cache root instead of the default application cache directory.
-    pub cache_dir: Option<PathBuf>,
-    /// Require all bundle files to already be cached. Use after first successful warm-up.
-    pub only_cached: bool,
-}
-
-impl Default for CompileOptions {
-    fn default() -> Self {
-        let cache_dir = default_cache_dir();
-        Self {
-            only_cached: cache_marker_is_valid(&cache_dir),
-            cache_dir: Some(cache_dir),
-        }
-    }
+struct CompileOptions {
+    cache_dir: PathBuf,
+    only_cached: bool,
 }
 
 pub fn cache_is_warmed() -> bool {
@@ -181,30 +179,60 @@ impl std::error::Error for CompileError {}
 
 /// Compile LaTeX to PDF bytes using default options.
 pub fn compile_latex(request: CompileRequest) -> Result<CompileOutput, CompileError> {
-    let options = CompileOptions::default();
-    match compile_latex_with_options(request.clone(), options.clone()) {
+    let cache_dir = default_cache_dir();
+    if !cache_marker_is_valid(&cache_dir) {
+        warm_cache(&cache_dir)?;
+    }
+
+    let cached = CompileOptions {
+        cache_dir: cache_dir.clone(),
+        only_cached: true,
+    };
+    match compile_latex_once(request.clone(), cached) {
         Ok(output) => Ok(output),
-        Err(_) if options.only_cached => {
-            let cache_dir = options.cache_dir.unwrap_or_else(default_cache_dir);
+        Err(_) => {
             invalidate_cache(&cache_dir);
-            compile_latex_with_options(
+            warm_cache(&cache_dir)?;
+            compile_latex_once(
                 request,
                 CompileOptions {
-                    cache_dir: Some(cache_dir),
-                    only_cached: false,
+                    cache_dir,
+                    only_cached: true,
                 },
             )
         }
-        Err(error) => Err(error),
     }
 }
 
+fn warm_cache(cache_dir: &std::path::Path) -> Result<(), CompileError> {
+    let document = Document::parse(CACHE_WARMUP_NOTE).map_err(|error| CompileError::Session {
+        message: format!("canonical cache warm-up note is invalid: {error}"),
+        diagnostics: CompileDiagnostics::default(),
+    })?;
+    let latex = emit_latex(&document);
+    let request = CompileRequest::new(0, &latex);
+    compile_latex_once(
+        request,
+        CompileOptions {
+            cache_dir: cache_dir.to_path_buf(),
+            only_cached: false,
+        },
+    )?;
+    fs::write(cache_dir.join(CACHE_READY_MARKER), cache_marker_contents()).map_err(|error| {
+        CompileError::CacheDirectory {
+            path: cache_dir.join(CACHE_READY_MARKER),
+            message: error.to_string(),
+        }
+    })?;
+    Ok(())
+}
+
 /// Compile LaTeX to PDF bytes synchronously. Safe to call from a background worker.
-pub fn compile_latex_with_options(
+fn compile_latex_once(
     request: CompileRequest,
     options: CompileOptions,
 ) -> Result<CompileOutput, CompileError> {
-    let cache_dir = options.cache_dir.unwrap_or_else(default_cache_dir);
+    let cache_dir = options.cache_dir;
     fs::create_dir_all(&cache_dir).map_err(|err| CompileError::CacheDirectory {
         path: cache_dir.clone(),
         message: err.to_string(),
@@ -291,13 +319,6 @@ pub fn compile_latex_with_options(
             diagnostics: status.diagnostics.clone(),
         })?;
 
-    fs::write(cache_dir.join(CACHE_READY_MARKER), cache_marker_contents()).map_err(|err| {
-        CompileError::CacheDirectory {
-            path: cache_dir.join(CACHE_READY_MARKER),
-            message: err.to_string(),
-        }
-    })?;
-
     Ok(CompileOutput {
         revision: request.revision,
         pdf,
@@ -309,7 +330,7 @@ pub fn compile_latex_with_options(
 }
 
 fn cache_marker_contents() -> String {
-    format!("format={FORMAT_VERSION}\ndigest={BUNDLE_DIGEST}\n")
+    format!("schema={CACHE_SCHEMA_VERSION}\nformat={FORMAT_VERSION}\ndigest={BUNDLE_DIGEST}\n")
 }
 
 fn cached_bundle_dir(cache_dir: &std::path::Path) -> PathBuf {

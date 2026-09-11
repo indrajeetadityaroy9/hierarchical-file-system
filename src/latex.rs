@@ -1,4 +1,5 @@
 use crate::document::{Block, Document, Inline, SourceMapEntry, SourceSpan};
+use crate::note::unicode_math_command;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LatexDocument {
@@ -100,6 +101,12 @@ pub fn emit_latex(document: &Document) -> LatexDocument {
 pub fn escape_prose(input: &str) -> String {
     let mut escaped = String::new();
     for character in input.chars() {
+        if let Some(command) = unicode_math_command(character) {
+            escaped.push_str(r"\ensuremath{");
+            escaped.push_str(command);
+            escaped.push('}');
+            continue;
+        }
         match character {
             '\\' => escaped.push_str(r"\textbackslash{}"),
             '{' => escaped.push_str(r"\{"),
@@ -142,16 +149,6 @@ impl Emitter {
 
 const TEMPLATE_PREFIX: &str = r"\documentclass[a4paper,11pt]{article}
 \usepackage[margin=20mm]{geometry}
-\usepackage{amsmath,amssymb,amsthm,mathtools}
-\usepackage{fontspec}
-\usepackage{unicode-math}
-\defaultfontfeatures{Ligatures=TeX}
-\setmainfont{lmroman10-regular.otf}[
-  BoldFont=lmroman10-bold.otf,
-  ItalicFont=lmroman10-italic.otf,
-  BoldItalicFont=lmroman10-bolditalic.otf
-]
-\setmathfont{latinmodern-math.otf}
 \pagestyle{plain}
 \setlength{\parindent}{0pt}
 \setlength{\parskip}{0.6em}

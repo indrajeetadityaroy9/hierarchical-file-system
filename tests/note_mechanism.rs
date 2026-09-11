@@ -17,8 +17,9 @@ fn mixed_notes_preserve_english_and_emit_canonical_mathematics() {
     assert!(
         generated
             .source()
-            .contains(r"\setmathfont{latinmodern-math.otf}")
+            .contains(r"\documentclass[a4paper,11pt]{article}")
     );
+    assert!(!generated.source().contains(r"\usepackage{unicode-math}"));
     assert!(
         generated
             .source()
@@ -90,6 +91,20 @@ fn explicit_math_cannot_inject_raw_latex_commands() {
                 .contains("not an unambiguous mathematical value")
         );
     }
+}
+
+#[test]
+fn common_unicode_math_is_canonicalized_without_unicode_math() {
+    let document = Document::parse("Let α satisfy $α squared is less than or equal to infinity$.")
+        .expect("Unicode mathematics parses");
+    let generated = emit_latex(&document);
+
+    assert!(
+        generated
+            .body()
+            .contains(r"Let \ensuremath{\alpha} satisfy")
+    );
+    assert!(generated.body().contains(r"\(\alpha^{2}\le{}\infty\)"));
 }
 
 #[test]

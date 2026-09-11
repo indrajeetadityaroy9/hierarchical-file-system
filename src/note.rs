@@ -382,13 +382,14 @@ fn collapse_whitespace(input: &str) -> String {
 }
 
 pub(crate) fn normalize_math(source: &str) -> Result<String, String> {
-    let unicode_normalized = source
-        .replace('×', r"\times")
-        .replace('≤', r"\le")
-        .replace('≥', r"\ge")
-        .replace('≠', r"\ne")
-        .replace('±', r"\pm")
-        .replace('∞', r"\infty");
+    let unicode_normalized = source.chars().fold(String::new(), |mut output, character| {
+        if let Some(command) = unicode_math_command(character) {
+            output.push_str(command);
+        } else {
+            output.push(character);
+        }
+        output
+    });
 
     if contains_natural_operator(source) {
         if source
@@ -527,6 +528,13 @@ fn contains_natural_operator(input: &str) -> bool {
 }
 
 fn normalize_single_atom(atom: &str) -> String {
+    let mut characters = atom.chars();
+    if let (Some(character), None) = (characters.next(), characters.next())
+        && let Some(command) = unicode_math_command(character)
+    {
+        return command.to_owned();
+    }
+
     match atom.to_ascii_lowercase().as_str() {
         "zero" => String::from("0"),
         "one" => String::from("1"),
@@ -549,6 +557,70 @@ fn normalize_single_atom(atom: &str) -> String {
         }
         _ => atom.to_string(),
     }
+}
+
+pub(crate) fn unicode_math_command(character: char) -> Option<&'static str> {
+    Some(match character {
+        'α' => r"\alpha",
+        'β' => r"\beta",
+        'γ' => r"\gamma",
+        'δ' => r"\delta",
+        'ε' => r"\epsilon",
+        'ζ' => r"\zeta",
+        'η' => r"\eta",
+        'θ' => r"\theta",
+        'ι' => r"\iota",
+        'κ' => r"\kappa",
+        'λ' => r"\lambda",
+        'μ' => r"\mu",
+        'ν' => r"\nu",
+        'ξ' => r"\xi",
+        'ο' => "o",
+        'π' => r"\pi",
+        'ρ' => r"\rho",
+        'σ' | 'ς' => r"\sigma",
+        'τ' => r"\tau",
+        'υ' => r"\upsilon",
+        'φ' => r"\phi",
+        'χ' => r"\chi",
+        'ψ' => r"\psi",
+        'ω' => r"\omega",
+        'Α' => "A",
+        'Β' => "B",
+        'Γ' => r"\Gamma",
+        'Δ' => r"\Delta",
+        'Ε' => "E",
+        'Ζ' => "Z",
+        'Η' => "H",
+        'Θ' => r"\Theta",
+        'Ι' => "I",
+        'Κ' => "K",
+        'Λ' => r"\Lambda",
+        'Μ' => "M",
+        'Ν' => "N",
+        'Ξ' => r"\Xi",
+        'Ο' => "O",
+        'Π' => r"\Pi",
+        'Ρ' => "P",
+        'Σ' => r"\Sigma",
+        'Τ' => "T",
+        'Υ' => r"\Upsilon",
+        'Φ' => r"\Phi",
+        'Χ' => "X",
+        'Ψ' => r"\Psi",
+        'Ω' => r"\Omega",
+        'ϵ' => r"\varepsilon",
+        'ϑ' => r"\vartheta",
+        'ϖ' => r"\varpi",
+        'ϱ' => r"\varrho",
+        '×' => r"\times{}",
+        '≤' => r"\le{}",
+        '≥' => r"\ge{}",
+        '≠' => r"\ne{}",
+        '±' => r"\pm{}",
+        '∞' => r"\infty",
+        _ => return None,
+    })
 }
 
 fn normalize_natural_atom(atom: &str) -> Result<String, String> {
@@ -643,7 +715,7 @@ impl<'a> NaturalMathParser<'a> {
         let mut left = self.parse_product()?;
         loop {
             let operator = if self.consume_phrase(&["plus", "or", "minus"]) {
-                Some(r"\pm")
+                Some(r"\pm{}")
             } else if self.consume_word("plus") {
                 Some("+")
             } else if self.consume_word("minus") {
@@ -722,11 +794,11 @@ impl<'a> NaturalMathParser<'a> {
         let initial_position = self.position;
         self.consume_word("is");
         if self.consume_phrase(&["less", "than", "or", "equal", "to"]) {
-            Some(r"\le")
+            Some(r"\le{}")
         } else if self.consume_phrase(&["greater", "than", "or", "equal", "to"]) {
-            Some(r"\ge")
+            Some(r"\ge{}")
         } else if self.consume_phrase(&["not", "equal", "to"]) {
-            Some(r"\ne")
+            Some(r"\ne{}")
         } else if self.consume_phrase(&["less", "than"]) {
             Some("<")
         } else if self.consume_phrase(&["greater", "than"]) {

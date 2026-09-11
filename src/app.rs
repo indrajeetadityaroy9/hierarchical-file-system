@@ -20,7 +20,7 @@ use crate::preview::{inspect_pdf, rasterize_page};
 use crate::ui;
 
 const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
-const COMPILE_DEBOUNCE: Duration = Duration::from_millis(350);
+const COMPILE_DEBOUNCE: Duration = Duration::from_millis(120);
 const DEFAULT_RASTER_WIDTH: u32 = 800;
 
 pub struct App {
