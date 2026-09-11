@@ -8,6 +8,12 @@ license = "MIT"
 [dependencies]
 color-eyre = "0.6"
 crossterm = "0.29"
+directories = "6.0"
+hayro = "0.7.1"
+image = { version = "0.25", default-features = false, features = ["png"] }
 ratatui = "0.30"
-txm = { version = "0.1.6", features = ["ratatui"] }
+ratatui-image = { version = "11.0.8", default-features = false, features = ["crossterm", "image-defaults"] }
+ropey = "1.6.1"
+tectonic = { version = "0.17.0", default-features = false, features = ["geturl-reqwest"] }
+tectonic_bundles = { version = "0.4.2", default-features = false, features = ["geturl-reqwest"] }
 unicode-width = "0.2"

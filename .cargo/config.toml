@@ -1,0 +1,5 @@
+[env]
+# Tectonic needs ICU's pkg-config metadata when built from source. Homebrew keeps
+# ICU keg-only on macOS, so include both Apple Silicon and Intel prefix paths.
+# pkg-config still searches its platform defaults after these additional paths.
+PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/icu4c/lib/pkgconfig:/usr/local/opt/icu4c/lib/pkgconfig", force = false }

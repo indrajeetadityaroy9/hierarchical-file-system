@@ -1,0 +1,128 @@
+use mathnote::document::{Block, Document, Inline, TextBuffer};
+use mathnote::latex::{emit_latex, escape_prose};
+use mathnote::note::{NoteLine, NoteSegment};
+
+#[test]
+fn mixed_notes_preserve_english_and_emit_canonical_mathematics() {
+    let input = "Proof: the words square root stay readable, while $root of 81$ is mathematics.";
+    let document = Document::parse(input).expect("mixed note parses");
+    let generated = emit_latex(&document);
+
+    assert!(
+        generated
+            .body()
+            .contains("the words square root stay readable")
+    );
+    assert!(generated.body().contains(r"\(\sqrt{81}\)"));
+    assert!(
+        generated
+            .source()
+            .contains(r"\setmathfont{latinmodern-math.otf}")
+    );
+    assert!(
+        generated
+            .source()
+            .contains(r"\usepackage[margin=20mm]{geometry}")
+    );
+    assert!(!generated.body().contains("$root of 81$"));
+}
+
+#[test]
+fn incomplete_math_language_remains_prose() {
+    let input = "The words square root remain readable, and a plus sign remains prose.";
+    let note = NoteLine::parse(input).expect("ordinary language");
+    assert!(matches!(
+        note.segments(),
+        [NoteSegment::Text(text)] if text == input
+    ));
+}
+
+#[test]
+fn display_math_and_source_spans_form_one_document_model() {
+    let input = "A proof begins here.\n\n$$\nx squared plus y squared equals z squared\n$$\n";
+    let document = Document::parse(input).expect("display math document");
+    let display = document
+        .blocks()
+        .iter()
+        .find_map(|block| match block {
+            Block::DisplayMath { latex, span, .. } => Some((latex, span)),
+            _ => None,
+        })
+        .expect("display block");
+
+    assert_eq!(display.0, r"x^{2}+y^{2}=z^{2}");
+    assert_eq!(
+        &input[display.1.range()],
+        "x squared plus y squared equals z squared"
+    );
+    assert!(
+        emit_latex(&document)
+            .body()
+            .contains("\\[\nx^{2}+y^{2}=z^{2}\n\\]")
+    );
+}
+
+#[test]
+fn malformed_explicit_math_fails_closed() {
+    let inline_error = Document::parse("Proof: $root of 81").expect_err("unclosed inline math");
+    assert!(inline_error.to_string().contains("unclosed inline"));
+
+    let display_error = Document::parse("$$\nroot of 81\n").expect_err("unclosed display math");
+    assert!(display_error.to_string().contains("unclosed display"));
+}
+
+#[test]
+fn prose_is_escaped_and_cannot_inject_latex() {
+    let escaped = escape_prose(r"Text with \input{secret}, 50%, x_y, and $5.");
+    assert_eq!(
+        escaped,
+        r"Text with \textbackslash{}input\{secret\}, 50\%, x\_y, and \$5."
+    );
+}
+
+#[test]
+fn explicit_math_cannot_inject_raw_latex_commands() {
+    for input in [r"$\input{file}$", r"$\a \b$"] {
+        let error = Document::parse(input).expect_err("raw LaTeX must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("not an unambiguous mathematical value")
+        );
+    }
+}
+
+#[test]
+fn rope_editor_is_multiline_unicode_safe_and_clearable() {
+    let mut buffer = TextBuffer::new("Proof: α\nroot of 81");
+    buffer.move_home();
+    buffer.insert_str("Given ");
+    assert_eq!(buffer.text(), "Proof: α\nGiven root of 81");
+
+    buffer.move_up();
+    buffer.move_end();
+    buffer.insert_char('.');
+    assert_eq!(buffer.text(), "Proof: α.\nGiven root of 81");
+
+    buffer.clear();
+    assert!(buffer.is_empty());
+    assert_eq!(buffer.cursor(), 0);
+}
+
+#[test]
+fn inline_source_spans_remain_exact_after_hidden_delimiters() {
+    let input = "before $root of 81$ after";
+    let document = Document::parse(input).expect("document");
+    let Block::Paragraph { inlines, .. } = &document.blocks()[0] else {
+        panic!("paragraph expected");
+    };
+    let Inline::Math { span, .. } = &inlines[1] else {
+        panic!("math expected");
+    };
+    let Inline::Text { source, .. } = &inlines[2] else {
+        panic!("trailing text expected");
+    };
+
+    assert_eq!(&input[span.range()], "root of 81");
+    assert_eq!(&input[source.range()], " after");
+}

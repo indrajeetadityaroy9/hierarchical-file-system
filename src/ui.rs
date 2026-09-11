@@ -1,26 +1,42 @@
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
-use txm::ratatui::Math;
-use unicode_width::UnicodeWidthStr;
+use ratatui::text::{Line, Span, Text};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Wrap};
+use ratatui_image::StatefulImage;
 
 use crate::App;
 
-pub(crate) fn render(frame: &mut Frame, app: &App) {
-    let [header_area, input_area, preview_area, help_area] =
-        frame.area().layout(&Layout::vertical([
-            Constraint::Length(2),
-            Constraint::Length(3),
-            Constraint::Fill(1),
-            Constraint::Length(1),
-        ]));
+const MIN_WIDTH: u16 = 90;
+const MIN_HEIGHT: u16 = 24;
+
+pub(crate) fn render(frame: &mut Frame, app: &mut App) {
+    let area = frame.area();
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        render_too_small(frame, area);
+        return;
+    }
+
+    let [header_area, content_area, status_area] = area.layout(&Layout::vertical([
+        Constraint::Length(2),
+        Constraint::Fill(1),
+        Constraint::Length(1),
+    ]));
+    let [left_area, preview_area] = content_area.layout(&Layout::horizontal([
+        Constraint::Percentage(45),
+        Constraint::Percentage(55),
+    ]));
+    let [source_area, latex_area] = left_area.layout(&Layout::vertical([
+        Constraint::Percentage(70),
+        Constraint::Percentage(30),
+    ]));
 
     render_header(frame, header_area);
-    render_input(frame, app, input_area);
-    render_preview(frame, app, preview_area);
-    render_help(frame, help_area);
+    let source_inner = render_source(frame, app, source_area);
+    render_generated_latex(frame, app, latex_area);
+    let preview_inner = render_preview(frame, app, preview_area);
+    app.configure_layout(source_inner.into(), preview_inner.into());
+    render_status(frame, app, status_area);
 }
 
 fn render_header(frame: &mut Frame, area: Rect) {
@@ -31,86 +47,133 @@ fn render_header(frame: &mut Frame, area: Rect) {
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::raw("  live terminal mathematics notebook"),
+        Span::raw("  natural-language mathematics → live LaTeX document"),
     ]);
-    frame.render_widget(Paragraph::new(title), area);
+    let help = Line::from("Ctrl-U clear  Ctrl-↑/↓ preview scroll  PgUp/PgDn pages  Esc quit")
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(Paragraph::new(vec![title, help]), area);
 }
 
-fn render_input(frame: &mut Frame, app: &App, area: Rect) {
+fn render_source(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" LaTeX input ")
+        .title(" Natural note ")
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return inner;
     }
 
-    let cursor_width = UnicodeWidthStr::width(&app.input()[..app.cursor()]) as u16;
-    let scroll = cursor_width.saturating_sub(inner.width.saturating_sub(1));
-    frame.render_widget(Paragraph::new(app.input()).scroll((0, scroll)), inner);
-    frame.set_cursor_position(Position::new(
-        inner.x + cursor_width.saturating_sub(scroll),
-        inner.y,
-    ));
+    let diagnostic_line = app.diagnostic_line();
+    let lines: Vec<Line<'static>> = (0..app.source_line_count())
+        .map(|line_index| {
+            let style = if diagnostic_line == Some(line_index) {
+                Style::default().fg(Color::White).bg(Color::Red)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            Line::styled(app.source_line(line_index), style)
+        })
+        .collect();
+    let (scroll_y, scroll_x) = app.source_scroll();
+    frame.render_widget(
+        Paragraph::new(Text::from(lines)).scroll((scroll_y, scroll_x)),
+        inner,
+    );
+
+    let (cursor_x, cursor_y) = app.cursor_screen_position();
+    if cursor_x < inner.width && cursor_y < inner.height {
+        frame.set_cursor_position(Position::new(inner.x + cursor_x, inner.y + cursor_y));
+    }
+    inner
 }
 
-fn render_preview(frame: &mut Frame, app: &App, area: Rect) {
+fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Terminal math preview ");
+        .title(" Generated LaTeX body ")
+        .border_style(Style::default().fg(Color::DarkGray));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-
     if inner.width == 0 || inner.height == 0 {
         return;
     }
 
-    match Math::new(app.input()) {
-        Ok(math) => (&math).render(inner, frame.buffer_mut()),
-        Err(error) => frame.render_widget(
-            Paragraph::new(format!("Cannot render: {error}"))
-                .style(Style::default().fg(Color::Red)),
-            inner,
-        ),
-    }
-}
-
-fn render_help(frame: &mut Frame, area: Rect) {
+    let body = app.generated_body();
+    let content = if body.trim().is_empty() {
+        Text::from(Line::styled(
+            "The generated document body will appear here.",
+            Style::default().fg(Color::DarkGray),
+        ))
+    } else {
+        Text::from(body.to_owned())
+    };
     frame.render_widget(
-        Paragraph::new("Type LaTeX to update the preview  •  Esc or Ctrl-C to quit")
-            .style(Style::default().fg(Color::DarkGray)),
-        area,
+        Paragraph::new(content)
+            .style(Style::default().fg(Color::Gray))
+            .wrap(Wrap { trim: false }),
+        inner,
     );
 }
 
-#[cfg(test)]
-mod tests {
-    use ratatui::Terminal;
-    use ratatui::backend::TestBackend;
-
-    use super::render;
-    use crate::App;
-
-    #[test]
-    fn renders_application_and_math_preview() {
-        let mut terminal = Terminal::new(TestBackend::new(80, 18)).expect("test terminal");
-        let app = App::default();
-
-        terminal.draw(|frame| render(frame, &app)).expect("draw");
-
-        let output: String = terminal
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|cell| cell.symbol())
-            .collect();
-        assert!(output.contains("mathnote"));
-        assert!(output.contains("LaTeX input"));
-        assert!(output.contains("Terminal math preview"));
-        assert!(output.contains('±'));
+fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) -> Rect {
+    let title = format!(
+        " LaTeX document · {} · {} ",
+        app.page_label(),
+        app.protocol_label()
+    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return inner;
     }
+
+    frame.render_widget(Clear, inner);
+    frame.render_widget(Block::new().style(Style::default().bg(Color::White)), inner);
+    if app.has_preview() {
+        StatefulImage::new().render(inner, frame.buffer_mut(), app.image_state_mut());
+    } else {
+        frame.render_widget(
+            Paragraph::new("Compiling the document preview…")
+                .style(Style::default().fg(Color::DarkGray).bg(Color::White))
+                .alignment(Alignment::Center),
+            inner,
+        );
+    }
+    inner
+}
+
+fn render_status(frame: &mut Frame, app: &App, area: Rect) {
+    let status = app.status_line();
+    let style = if status.starts_with("error:") {
+        Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    frame.render_widget(Paragraph::new(status).style(style), area);
+}
+
+fn render_too_small(frame: &mut Frame, area: Rect) {
+    let message = format!(
+        "mathnote needs at least {MIN_WIDTH}×{MIN_HEIGHT} cells\ncurrent terminal: {}×{}",
+        area.width, area.height
+    );
+    frame.render_widget(
+        Paragraph::new(message)
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Yellow))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Resize terminal "),
+            ),
+        area,
+    );
 }
