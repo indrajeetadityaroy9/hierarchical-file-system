@@ -136,7 +136,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) -> Rect {
         StatefulImage::new().render(inner, frame.buffer_mut(), app.image_state_mut());
     } else {
         frame.render_widget(
-            Paragraph::new("Compiling the document preview…")
+            Paragraph::new(app.preview_placeholder())
                 .style(Style::default().fg(Color::DarkGray).bg(Color::White))
                 .alignment(Alignment::Center),
             inner,

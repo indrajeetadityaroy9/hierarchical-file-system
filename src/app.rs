@@ -84,6 +84,7 @@ impl PaneFocus {
 
 #[derive(Debug, Clone)]
 enum PipelineStatus {
+    Empty,
     Waiting,
     Compiling { bootstrap: bool },
     Rasterizing,
@@ -432,6 +433,16 @@ impl App {
 
     fn rebuild_document(&mut self) {
         let source = self.buffer.text();
+        if source.trim().is_empty() {
+            self.generated = Document::parse(&source)
+                .ok()
+                .map(|document| emit_latex(&document));
+            self.generated_revision = Some(self.revision);
+            self.latex_scroll_rows = 0;
+            self.status = PipelineStatus::Empty;
+            self.diagnostic_span = None;
+            return;
+        }
         match Document::parse(&source) {
             Ok(document) => {
                 self.generated = Some(emit_latex(&document));
@@ -455,7 +466,8 @@ impl App {
     }
 
     fn maybe_submit_compile(&mut self) {
-        if self.generated_revision != Some(self.revision)
+        if matches!(self.status, PipelineStatus::Empty)
+            || self.generated_revision != Some(self.revision)
             || self.submitted_revision == Some(self.revision)
             || self.last_edit.elapsed() < COMPILE_DEBOUNCE
         {
@@ -743,6 +755,7 @@ impl App {
 
     pub(crate) fn status_line(&self) -> String {
         match &self.status {
+            PipelineStatus::Empty => String::from("type a note to begin"),
             PipelineStatus::Waiting => String::from("waiting for input to settle"),
             PipelineStatus::Compiling { bootstrap: true } => {
                 String::from("preparing local LaTeX resources and compiling…")
@@ -777,6 +790,14 @@ impl App {
 
     pub(crate) fn has_preview(&self) -> bool {
         self.full_page.is_some()
+    }
+
+    pub(crate) fn preview_placeholder(&self) -> &'static str {
+        if matches!(self.status, PipelineStatus::Empty) {
+            "Start typing to build a LaTeX document."
+        } else {
+            "Compiling the document preview…"
+        }
     }
 
     pub(crate) fn image_state_mut(&mut self) -> &mut ThreadProtocol {
@@ -963,5 +984,30 @@ mod tests {
         assert_eq!(app.focus(), PaneFocus::Preview);
         app.handle_key(press(KeyCode::Char('h')));
         assert_eq!(app.focus(), PaneFocus::Latex);
+    }
+
+    #[test]
+    fn blank_notes_do_not_submit_a_compile() {
+        let mut app = App::default();
+        app.maybe_submit_compile();
+
+        assert!(matches!(app.status, PipelineStatus::Empty));
+        assert_eq!(app.submitted_revision, None);
+        assert_eq!(app.status_line(), "type a note to begin");
+        assert_eq!(
+            app.preview_placeholder(),
+            "Start typing to build a LaTeX document."
+        );
+    }
+
+    #[test]
+    fn whitespace_only_notes_remain_in_the_empty_state() {
+        let mut app = App::default();
+        app.buffer.insert_str(" \n\t");
+        app.mark_edited();
+        app.maybe_submit_compile();
+
+        assert!(matches!(app.status, PipelineStatus::Empty));
+        assert_eq!(app.submitted_revision, None);
     }
 }
