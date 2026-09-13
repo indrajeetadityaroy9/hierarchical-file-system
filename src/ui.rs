@@ -50,7 +50,12 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rec
     }
 
     let diagnostic_line = app.diagnostic_line();
-    let lines: Vec<Line<'static>> = (0..app.source_line_count())
+    let (scroll_y, scroll_x) = app.source_scroll();
+    let first_line = usize::from(scroll_y);
+    let end_line = first_line
+        .saturating_add(usize::from(inner.height))
+        .min(app.source_line_count());
+    let lines: Vec<Line<'static>> = (first_line..end_line)
         .map(|line_index| {
             let style = if diagnostic_line == Some(line_index) {
                 Style::default().fg(Color::White).bg(theme.error)
@@ -60,9 +65,8 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rec
             Line::styled(app.source_line(line_index), style)
         })
         .collect();
-    let (scroll_y, scroll_x) = app.source_scroll();
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((scroll_y, scroll_x)),
+        Paragraph::new(Text::from(lines)).scroll((0, scroll_x)),
         inner,
     );
 
@@ -87,16 +91,16 @@ fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect, theme: &Them
     }
 
     let body = app.generated_body();
-    let content = if body.trim().is_empty() {
-        Text::from(Line::styled(
+    let paragraph = if body.trim().is_empty() {
+        Paragraph::new(Line::styled(
             "The generated document body will appear here.",
             Style::default().fg(theme.muted),
         ))
     } else {
-        Text::from(body.to_owned())
+        Paragraph::new(body)
     };
     frame.render_widget(
-        Paragraph::new(content)
+        paragraph
             .style(Style::default().fg(theme.foreground))
             .wrap(Wrap { trim: false })
             .scroll((app.latex_scroll(), 0)),

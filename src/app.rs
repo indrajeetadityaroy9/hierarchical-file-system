@@ -194,23 +194,32 @@ impl App {
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
+        let mut needs_draw = true;
         while !self.should_quit {
-            self.process_background_events();
-            self.maybe_submit_compile();
-            self.maybe_submit_raster();
+            needs_draw |= self.process_background_events();
+            needs_draw |= self.maybe_submit_compile();
+            needs_draw |= self.maybe_submit_raster();
 
-            terminal.draw(|frame| ui::render(frame, &mut self))?;
+            if needs_draw {
+                terminal.draw(|frame| ui::render(frame, &mut self))?;
+                needs_draw = false;
 
-            self.maybe_submit_compile();
-            self.maybe_submit_raster();
+                needs_draw |= self.maybe_submit_compile();
+                needs_draw |= self.maybe_submit_raster();
+            }
 
             if event::poll(EVENT_POLL_INTERVAL)? {
                 match event::read()? {
-                    Event::Key(key) => self.handle_key(key),
+                    Event::Key(key) => {
+                        self.handle_key(key);
+                        needs_draw = true;
+                    }
                     Event::Paste(text) => {
                         self.buffer.insert_str(&text);
                         self.mark_edited();
+                        needs_draw = true;
                     }
+                    Event::Resize(_, _) => needs_draw = true,
                     _ => {}
                 }
             }
@@ -478,16 +487,16 @@ impl App {
         }
     }
 
-    fn maybe_submit_compile(&mut self) {
+    fn maybe_submit_compile(&mut self) -> bool {
         if matches!(self.status, PipelineStatus::Empty)
             || self.generated_revision != Some(self.revision)
             || self.submitted_revision == Some(self.revision)
             || self.last_edit.elapsed() < COMPILE_DEBOUNCE
         {
-            return;
+            return false;
         }
         let Some(generated) = &self.generated else {
-            return;
+            return false;
         };
 
         let target_width = self.target_raster_width();
@@ -505,21 +514,22 @@ impl App {
         } else {
             self.status = PipelineStatus::Error(String::from("preview worker stopped"));
         }
+        true
     }
 
-    fn maybe_submit_raster(&mut self) {
+    fn maybe_submit_raster(&mut self) -> bool {
         let Some(pdf) = &self.pdf else {
-            return;
+            return false;
         };
         if self.pdf_revision != Some(self.revision) {
-            return;
+            return false;
         }
         let target_width = self.target_raster_width();
         let key = (self.revision, self.page_index, target_width);
         if self.requested_raster == Some(key)
             || (self.full_page_width == target_width && self.full_page.is_some())
         {
-            return;
+            return false;
         }
 
         if self
@@ -534,11 +544,16 @@ impl App {
         {
             self.requested_raster = Some(key);
             self.status = PipelineStatus::Rasterizing;
+            true
+        } else {
+            false
         }
     }
 
-    fn process_background_events(&mut self) {
+    fn process_background_events(&mut self) -> bool {
+        let mut changed = false;
         while let Ok(result) = self.resize_rx.try_recv() {
+            changed = true;
             match result {
                 Ok(response) => {
                     self.image_state.update_resized_protocol(response);
@@ -550,6 +565,7 @@ impl App {
         }
 
         while let Ok(event) = self.worker_rx.try_recv() {
+            changed = true;
             match event {
                 WorkerEvent::Ready {
                     revision,
@@ -603,6 +619,7 @@ impl App {
                 _ => {}
             }
         }
+        changed
     }
 
     fn install_visible_preview(&mut self) {
@@ -671,7 +688,7 @@ impl App {
             self.full_page = None;
             self.full_page_width = 0;
             self.requested_raster = None;
-            self.maybe_submit_raster();
+            let _ = self.maybe_submit_raster();
         }
     }
 
