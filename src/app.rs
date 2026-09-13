@@ -26,6 +26,7 @@ const DEFAULT_RASTER_WIDTH: u32 = 800;
 pub struct App {
     buffer: TextBuffer,
     should_quit: bool,
+    show_help: bool,
     focus: PaneFocus,
     revision: u64,
     generated_revision: Option<u64>,
@@ -159,6 +160,7 @@ impl App {
         let mut app = Self {
             buffer,
             should_quit: false,
+            show_help: false,
             focus: PaneFocus::Source,
             revision: 1,
             generated_revision: None,
@@ -218,6 +220,17 @@ impl App {
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return;
+        }
+
+        if key.code == KeyCode::F(1) {
+            self.show_help = !self.show_help;
+            return;
+        }
+        if self.show_help {
+            if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+                self.show_help = false;
+            }
             return;
         }
 
@@ -742,6 +755,18 @@ impl App {
         self.focus
     }
 
+    pub(crate) fn focus_label(&self) -> &'static str {
+        match self.focus {
+            PaneFocus::Source => "SOURCE",
+            PaneFocus::Latex => "LATEX",
+            PaneFocus::Preview => "PREVIEW",
+        }
+    }
+
+    pub(crate) fn show_help(&self) -> bool {
+        self.show_help
+    }
+
     pub(crate) fn latex_scroll(&self) -> u16 {
         self.latex_scroll_rows
     }
@@ -1009,5 +1034,16 @@ mod tests {
 
         assert!(matches!(app.status, PipelineStatus::Empty));
         assert_eq!(app.submitted_revision, None);
+    }
+
+    #[test]
+    fn help_overlay_can_be_opened_and_closed_without_quitting() {
+        let mut app = App::default();
+        app.handle_key(press(KeyCode::F(1)));
+        assert!(app.show_help());
+
+        app.handle_key(press(KeyCode::Esc));
+        assert!(!app.show_help());
+        assert!(!app.should_quit);
     }
 }
