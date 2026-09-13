@@ -9,6 +9,7 @@ pub struct TextBuffer {
     rope: Rope,
     cursor: usize,
     preferred_column: Option<usize>,
+    non_whitespace_chars: usize,
 }
 
 impl Default for TextBuffer {
@@ -25,6 +26,10 @@ impl TextBuffer {
             rope,
             cursor,
             preferred_column: None,
+            non_whitespace_chars: text
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .count(),
         }
     }
 
@@ -34,6 +39,14 @@ impl TextBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.rope.len_chars() == 0
+    }
+
+    pub fn is_blank(&self) -> bool {
+        self.non_whitespace_chars == 0
+    }
+
+    pub fn len_chars(&self) -> usize {
+        self.rope.len_chars()
     }
 
     pub fn cursor(&self) -> usize {
@@ -56,21 +69,47 @@ impl TextBuffer {
         (line, self.cursor - self.rope.line_to_char(line))
     }
 
+    pub fn cursor_display_column(&self) -> usize {
+        let line = self.rope.char_to_line(self.cursor);
+        let line_start = self.rope.line_to_char(line);
+        self.rope
+            .slice(line_start..self.cursor)
+            .chars()
+            .map(|character| unicode_width::UnicodeWidthChar::width(character).unwrap_or(0))
+            .sum()
+    }
+
+    pub fn set_cursor_line_column(&mut self, line: usize, column: usize) {
+        let line = line.min(self.rope.len_lines().saturating_sub(1));
+        self.cursor = self.rope.line_to_char(line) + column.min(self.line_content_len(line));
+        self.preferred_column = None;
+    }
+
     pub fn insert_char(&mut self, character: char) {
         self.rope.insert_char(self.cursor, character);
         self.cursor += 1;
+        if !character.is_whitespace() {
+            self.non_whitespace_chars += 1;
+        }
         self.preferred_column = None;
     }
 
     pub fn insert_str(&mut self, text: &str) {
         self.rope.insert(self.cursor, text);
         self.cursor += text.chars().count();
+        self.non_whitespace_chars += text
+            .chars()
+            .filter(|character| !character.is_whitespace())
+            .count();
         self.preferred_column = None;
     }
 
     pub fn backspace(&mut self) -> bool {
         if self.cursor == 0 {
             return false;
+        }
+        if !self.rope.char(self.cursor - 1).is_whitespace() {
+            self.non_whitespace_chars -= 1;
         }
         self.rope.remove(self.cursor - 1..self.cursor);
         self.cursor -= 1;
@@ -82,6 +121,9 @@ impl TextBuffer {
         if self.cursor == self.rope.len_chars() {
             return false;
         }
+        if !self.rope.char(self.cursor).is_whitespace() {
+            self.non_whitespace_chars -= 1;
+        }
         self.rope.remove(self.cursor..self.cursor + 1);
         self.preferred_column = None;
         true
@@ -91,6 +133,7 @@ impl TextBuffer {
         self.rope = Rope::new();
         self.cursor = 0;
         self.preferred_column = None;
+        self.non_whitespace_chars = 0;
     }
 
     pub fn move_left(&mut self) {

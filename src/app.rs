@@ -3,10 +3,13 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use image::{DynamicImage, ImageBuffer, Rgba, imageops};
 use ratatui::DefaultTerminal;
-use ratatui::layout::Size;
+use ratatui::layout::{Rect, Size};
 use ratatui_image::errors::Errors as ImageError;
 use ratatui_image::picker::Picker;
 use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
@@ -20,14 +23,20 @@ use crate::latex::{LatexDocument, emit_latex};
 use crate::preview::{inspect_pdf, rasterize_page};
 use crate::ui;
 
-const EVENT_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const ACTIVE_POLL_INTERVAL: Duration = Duration::from_millis(16);
+const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const SPINNER_INTERVAL: Duration = Duration::from_millis(80);
 const COMPILE_DEBOUNCE: Duration = Duration::from_millis(120);
 const DEFAULT_RASTER_WIDTH: u32 = 800;
+const SPINNER_FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+
+type PreviewViewportKey = (Option<u64>, usize, u32, u16, u16, u16);
 
 pub struct App {
     buffer: TextBuffer,
     should_quit: bool,
     show_help: bool,
+    zen_mode: bool,
     focus: PaneFocus,
     revision: u64,
     generated_revision: Option<u64>,
@@ -38,17 +47,24 @@ pub struct App {
     worker_rx: mpsc::Receiver<WorkerEvent>,
     status: PipelineStatus,
     diagnostic_span: Option<SourceSpan>,
+    spinner_frame: usize,
+    last_spinner_tick: Instant,
+    source_characters: usize,
+    source_words: usize,
 
     picker: Picker,
     active_image: ImageSlot,
     staging_image: ImageSlot,
     staging_preview: bool,
     preview_visible: bool,
+    active_preview_key: Option<PreviewViewportKey>,
+    staging_preview_key: Option<PreviewViewportKey>,
     pdf: Option<Arc<Vec<u8>>>,
     pdf_revision: Option<u64>,
     page_count: usize,
     page_index: usize,
     full_page: Option<DynamicImage>,
+    full_page_revision: Option<u64>,
     full_page_width: u32,
     requested_raster: Option<(u64, usize, u32)>,
 
@@ -59,6 +75,9 @@ pub struct App {
     latex_scroll_rows: u16,
     preview_size: Size,
     preview_scroll_rows: u16,
+    source_area: Rect,
+    latex_area: Rect,
+    preview_area: Rect,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,7 +118,7 @@ enum PipelineStatus {
 enum WorkerRequest {
     Compile {
         revision: u64,
-        document: LatexDocument,
+        source: String,
         page_index: usize,
         target_width: u32,
     },
@@ -112,6 +131,11 @@ enum WorkerRequest {
 }
 
 enum WorkerEvent {
+    Built {
+        revision: u64,
+        document: LatexDocument,
+        words: usize,
+    },
     Ready {
         revision: u64,
         pdf: Arc<Vec<u8>>,
@@ -132,6 +156,11 @@ enum WorkerEvent {
         revision: u64,
         message: String,
         tex_line: Option<usize>,
+    },
+    ParseFailed {
+        revision: u64,
+        message: String,
+        byte: usize,
     },
 }
 
@@ -177,6 +206,7 @@ impl App {
             buffer,
             should_quit: false,
             show_help: false,
+            zen_mode: false,
             focus: PaneFocus::Source,
             revision: 1,
             generated_revision: None,
@@ -187,16 +217,23 @@ impl App {
             worker_rx,
             status: PipelineStatus::Waiting,
             diagnostic_span: None,
+            spinner_frame: 0,
+            last_spinner_tick: Instant::now(),
+            source_characters: 0,
+            source_words: 0,
             picker,
             active_image: ImageSlot::new(),
             staging_image: ImageSlot::new(),
             staging_preview: false,
             preview_visible: false,
+            active_preview_key: None,
+            staging_preview_key: None,
             pdf: None,
             pdf_revision: None,
             page_count: 0,
             page_index: 0,
             full_page: None,
+            full_page_revision: None,
             full_page_width: 0,
             requested_raster: None,
             source_size: Size::default(),
@@ -206,8 +243,11 @@ impl App {
             latex_scroll_rows: 0,
             preview_size: Size::new(80, 24),
             preview_scroll_rows: 0,
+            source_area: Rect::default(),
+            latex_area: Rect::default(),
+            preview_area: Rect::default(),
         };
-        app.rebuild_document();
+        app.refresh_source_state();
         app
     }
 
@@ -217,6 +257,7 @@ impl App {
             needs_draw |= self.process_background_events();
             needs_draw |= self.maybe_submit_compile();
             needs_draw |= self.maybe_submit_raster();
+            needs_draw |= self.advance_spinner();
 
             if needs_draw {
                 terminal.draw(|frame| ui::render(frame, &mut self))?;
@@ -226,7 +267,7 @@ impl App {
                 needs_draw |= self.maybe_submit_raster();
             }
 
-            if event::poll(EVENT_POLL_INTERVAL)? {
+            if event::poll(self.poll_interval())? {
                 match event::read()? {
                     Event::Key(key) => {
                         self.handle_key(key);
@@ -235,6 +276,10 @@ impl App {
                     Event::Paste(text) => {
                         self.buffer.insert_str(&text);
                         self.mark_edited();
+                        needs_draw = true;
+                    }
+                    Event::Mouse(mouse) => {
+                        self.handle_mouse(mouse);
                         needs_draw = true;
                     }
                     Event::Resize(_, _) => needs_draw = true,
@@ -258,6 +303,11 @@ impl App {
             if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
                 self.show_help = false;
             }
+            return;
+        }
+
+        if key.code == KeyCode::F(2) {
+            self.zen_mode = !self.zen_mode;
             return;
         }
 
@@ -467,60 +517,54 @@ impl App {
         self.submitted_revision = None;
         self.requested_raster = None;
         self.diagnostic_span = None;
-        self.rebuild_document();
+        self.refresh_source_state();
         self.ensure_cursor_visible();
     }
 
-    fn rebuild_document(&mut self) {
-        let source = self.buffer.text();
-        if source.trim().is_empty() {
-            self.generated = Document::parse(&source)
+    fn refresh_source_state(&mut self) {
+        self.source_characters = self.buffer.len_chars();
+        if self.buffer.is_blank() {
+            self.source_words = 0;
+            self.generated = Document::parse("")
                 .ok()
                 .map(|document| emit_latex(&document));
             self.generated_revision = Some(self.revision);
             self.latex_scroll_rows = 0;
+            self.pdf = None;
+            self.pdf_revision = None;
+            self.page_count = 0;
+            self.page_index = 0;
+            self.full_page = None;
+            self.full_page_revision = None;
+            self.full_page_width = 0;
+            self.requested_raster = None;
+            self.active_image.protocol.empty_protocol();
+            self.staging_image.protocol.empty_protocol();
+            self.staging_preview = false;
+            self.preview_visible = false;
+            self.active_preview_key = None;
+            self.staging_preview_key = None;
             self.status = PipelineStatus::Empty;
             self.diagnostic_span = None;
             return;
         }
-        match Document::parse(&source) {
-            Ok(document) => {
-                self.generated = Some(emit_latex(&document));
-                self.generated_revision = Some(self.revision);
-                self.latex_scroll_rows = 0;
-                self.status = PipelineStatus::Waiting;
-                self.diagnostic_span = None;
-            }
-            Err(error) => {
-                let byte = match &error {
-                    crate::note::NoteError::InvalidMath { byte, .. } => *byte,
-                };
-                self.generated_revision = None;
-                self.status = PipelineStatus::Error(error.to_string());
-                self.diagnostic_span = Some(SourceSpan {
-                    start: byte,
-                    end: byte.saturating_add(1),
-                });
-            }
-        }
+        self.generated_revision = None;
+        self.status = PipelineStatus::Waiting;
+        self.diagnostic_span = None;
     }
 
     fn maybe_submit_compile(&mut self) -> bool {
         if matches!(self.status, PipelineStatus::Empty)
-            || self.generated_revision != Some(self.revision)
             || self.submitted_revision == Some(self.revision)
             || self.last_edit.elapsed() < COMPILE_DEBOUNCE
         {
             return false;
         }
-        let Some(generated) = &self.generated else {
-            return false;
-        };
 
         let target_width = self.target_raster_width();
         let request = WorkerRequest::Compile {
             revision: self.revision,
-            document: generated.clone(),
+            source: self.buffer.text(),
             page_index: 0,
             target_width,
         };
@@ -576,9 +620,10 @@ impl App {
                 Ok(response) => {
                     self.active_image.protocol.update_resized_protocol(response);
                 }
-                Err(error) => {
+                Err(error) if self.preview_visible => {
                     self.status = PipelineStatus::Error(format!("terminal image error: {error}"));
                 }
+                Err(_) => {}
             }
         }
 
@@ -595,11 +640,17 @@ impl App {
                         std::mem::swap(&mut self.active_image, &mut self.staging_image);
                         self.staging_preview = false;
                         self.preview_visible = true;
+                        self.active_preview_key = self.staging_preview_key.take();
                     }
                 }
                 Err(error) => {
+                    let was_staging = self.staging_preview;
                     self.staging_preview = false;
-                    self.status = PipelineStatus::Error(format!("terminal image error: {error}"));
+                    self.staging_preview_key = None;
+                    if was_staging {
+                        self.status =
+                            PipelineStatus::Error(format!("terminal image error: {error}"));
+                    }
                 }
             }
         }
@@ -607,6 +658,17 @@ impl App {
         while let Ok(event) = self.worker_rx.try_recv() {
             changed = true;
             match event {
+                WorkerEvent::Built {
+                    revision,
+                    document,
+                    words,
+                } if revision == self.revision => {
+                    self.generated = Some(document);
+                    self.generated_revision = Some(revision);
+                    self.source_words = words;
+                    self.latex_scroll_rows = 0;
+                    self.diagnostic_span = None;
+                }
                 WorkerEvent::Ready {
                     revision,
                     pdf,
@@ -622,6 +684,7 @@ impl App {
                     self.page_count = page_count;
                     self.page_index = page_index.min(page_count.saturating_sub(1));
                     self.full_page = Some(image);
+                    self.full_page_revision = Some(revision);
                     self.full_page_width = width;
                     self.requested_raster = None;
                     self.preview_scroll_rows = 0;
@@ -635,6 +698,7 @@ impl App {
                     width,
                 } if revision == self.revision && page_index == self.page_index => {
                     self.full_page = Some(image);
+                    self.full_page_revision = Some(revision);
                     self.full_page_width = width;
                     self.requested_raster = None;
                     self.status = PipelineStatus::Ready {
@@ -656,6 +720,19 @@ impl App {
                             .and_then(|generated| generated.source_span_for_output_line(line))
                     });
                 }
+                WorkerEvent::ParseFailed {
+                    revision,
+                    message,
+                    byte,
+                } if revision == self.revision => {
+                    self.generated_revision = None;
+                    self.requested_raster = None;
+                    self.status = PipelineStatus::Error(message);
+                    self.diagnostic_span = Some(SourceSpan {
+                        start: byte,
+                        end: byte.saturating_add(1),
+                    });
+                }
                 _ => {}
             }
         }
@@ -667,6 +744,17 @@ impl App {
             return;
         };
         if self.preview_size.width == 0 || self.preview_size.height == 0 {
+            return;
+        }
+        let key = (
+            self.full_page_revision,
+            self.page_index,
+            self.full_page_width,
+            self.preview_size.width,
+            self.preview_size.height,
+            self.preview_scroll_rows,
+        );
+        if self.active_preview_key == Some(key) || self.staging_preview_key == Some(key) {
             return;
         }
         let font = self.picker.font_size();
@@ -690,6 +778,7 @@ impl App {
             .protocol
             .resize_encode(&Resize::Fit(None), self.preview_size);
         self.staging_preview = true;
+        self.staging_preview_key = Some(key);
     }
 
     fn scroll_preview(&mut self, rows: i16) {
@@ -721,6 +810,109 @@ impl App {
             .min(usize::from(u16::MAX)) as u16
     }
 
+    fn pipeline_is_active(&self) -> bool {
+        matches!(
+            self.status,
+            PipelineStatus::Compiling { .. } | PipelineStatus::Rasterizing
+        ) || self.staging_preview
+    }
+
+    fn advance_spinner(&mut self) -> bool {
+        if !self.pipeline_is_active() || self.last_spinner_tick.elapsed() < SPINNER_INTERVAL {
+            return false;
+        }
+        self.spinner_frame = self.spinner_frame.wrapping_add(1);
+        self.last_spinner_tick = Instant::now();
+        true
+    }
+
+    fn poll_interval(&self) -> Duration {
+        if self.pipeline_is_active() {
+            return ACTIVE_POLL_INTERVAL;
+        }
+        if matches!(self.status, PipelineStatus::Waiting)
+            && self.submitted_revision != Some(self.revision)
+        {
+            return COMPILE_DEBOUNCE
+                .saturating_sub(self.last_edit.elapsed())
+                .min(IDLE_POLL_INTERVAL);
+        }
+        IDLE_POLL_INTERVAL
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.show_help {
+            return;
+        }
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                if contains(self.source_area, mouse.column, mouse.row) {
+                    self.focus = PaneFocus::Source;
+                    self.place_source_cursor(mouse.column, mouse.row);
+                } else if contains(self.latex_area, mouse.column, mouse.row) {
+                    self.focus = PaneFocus::Latex;
+                } else if contains(self.preview_area, mouse.column, mouse.row) {
+                    self.focus = PaneFocus::Preview;
+                }
+            }
+            MouseEventKind::ScrollUp => self.scroll_at(mouse.column, mouse.row, -3),
+            MouseEventKind::ScrollDown => self.scroll_at(mouse.column, mouse.row, 3),
+            _ => {}
+        }
+    }
+
+    fn scroll_at(&mut self, column: u16, row: u16, rows: i16) {
+        if contains(self.source_area, column, row) {
+            self.focus = PaneFocus::Source;
+            for _ in 0..rows.unsigned_abs() {
+                if rows < 0 {
+                    self.buffer.move_up();
+                } else {
+                    self.buffer.move_down();
+                }
+            }
+            self.ensure_cursor_visible();
+        } else if contains(self.latex_area, column, row) {
+            self.focus = PaneFocus::Latex;
+            self.scroll_latex(rows);
+        } else if contains(self.preview_area, column, row) {
+            self.focus = PaneFocus::Preview;
+            self.scroll_preview(rows);
+        }
+    }
+
+    fn place_source_cursor(&mut self, column: u16, row: u16) {
+        let inner = self.source_area.inner(ratatui::layout::Margin::new(1, 1));
+        if !contains(inner, column, row) {
+            return;
+        }
+        let gutter = ui::source_gutter_width(self.source_line_count(), inner.width);
+        let content_x = inner.x.saturating_add(gutter);
+        if column < content_x {
+            return;
+        }
+        let line_index = self
+            .source_scroll_y
+            .saturating_add(usize::from(row.saturating_sub(inner.y)))
+            .min(self.buffer.len_lines().saturating_sub(1));
+        let target_display_column = usize::from(self.source_scroll_x)
+            .saturating_add(usize::from(column.saturating_sub(content_x)));
+        let line = self.buffer.line(line_index);
+        let mut display_column = 0usize;
+        let mut character_column = 0usize;
+        for character in line.chars() {
+            let width = unicode_width::UnicodeWidthChar::width(character).unwrap_or(0);
+            if display_column.saturating_add(width) > target_display_column {
+                break;
+            }
+            display_column = display_column.saturating_add(width);
+            character_column += 1;
+        }
+        self.buffer
+            .set_cursor_line_column(line_index, character_column);
+        self.ensure_cursor_visible();
+    }
+
     fn change_page(&mut self, delta: isize) {
         if self.page_count == 0 {
             return;
@@ -733,6 +925,7 @@ impl App {
             self.page_index = next;
             self.preview_scroll_rows = 0;
             self.full_page = None;
+            self.full_page_revision = None;
             self.full_page_width = 0;
             self.requested_raster = None;
             let _ = self.maybe_submit_raster();
@@ -748,7 +941,7 @@ impl App {
     }
 
     fn ensure_cursor_visible(&mut self) {
-        let (line, column) = self.buffer.cursor_line_column();
+        let (line, _) = self.buffer.cursor_line_column();
         let height = usize::from(self.source_size.height.max(1));
         if line < self.source_scroll_y {
             self.source_scroll_y = line;
@@ -756,9 +949,7 @@ impl App {
             self.source_scroll_y = line + 1 - height;
         }
 
-        let line_text = self.buffer.line(line);
-        let prefix: String = line_text.chars().take(column).collect();
-        let display_column = unicode_width::UnicodeWidthStr::width(prefix.as_str()) as u16;
+        let display_column = self.buffer.cursor_display_column().min(u16::MAX as usize) as u16;
         let width = self.source_size.width.max(1);
         if display_column < self.source_scroll_x {
             self.source_scroll_x = display_column;
@@ -785,6 +976,17 @@ impl App {
         }
     }
 
+    pub(crate) fn configure_pane_areas(
+        &mut self,
+        source_area: Rect,
+        latex_area: Rect,
+        preview_area: Rect,
+    ) {
+        self.source_area = source_area;
+        self.latex_area = latex_area;
+        self.preview_area = preview_area;
+    }
+
     pub(crate) fn source_line_count(&self) -> usize {
         self.buffer.len_lines()
     }
@@ -801,10 +1003,8 @@ impl App {
     }
 
     pub(crate) fn cursor_screen_position(&self) -> (u16, u16) {
-        let (line, column) = self.buffer.cursor_line_column();
-        let line_text = self.buffer.line(line);
-        let prefix: String = line_text.chars().take(column).collect();
-        let display_column = unicode_width::UnicodeWidthStr::width(prefix.as_str()) as u16;
+        let (line, _) = self.buffer.cursor_line_column();
+        let display_column = self.buffer.cursor_display_column().min(u16::MAX as usize) as u16;
         (
             display_column.saturating_sub(self.source_scroll_x),
             (line.saturating_sub(self.source_scroll_y)).min(u16::MAX as usize) as u16,
@@ -817,6 +1017,22 @@ impl App {
 
     pub(crate) fn focus(&self) -> PaneFocus {
         self.focus
+    }
+
+    pub(crate) fn zen_mode(&self) -> bool {
+        self.zen_mode
+    }
+
+    pub(crate) fn cursor_line_column(&self) -> (usize, usize) {
+        self.buffer.cursor_line_column()
+    }
+
+    pub(crate) fn source_stats(&self) -> (usize, Option<usize>, usize) {
+        (
+            self.source_characters,
+            (self.generated_revision == Some(self.revision)).then_some(self.source_words),
+            self.buffer.len_lines(),
+        )
     }
 
     pub(crate) fn focus_label(&self) -> &'static str {
@@ -847,12 +1063,21 @@ impl App {
             PipelineStatus::Empty => String::from("type a note to begin"),
             PipelineStatus::Waiting => String::from("waiting for input to settle"),
             PipelineStatus::Compiling { bootstrap: true } => {
-                String::from("preparing local LaTeX resources and compiling…")
+                format!(
+                    "{} preparing local LaTeX resources and compiling…",
+                    SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+                )
             }
             PipelineStatus::Compiling { bootstrap: false } => {
-                String::from("compiling with embedded Tectonic…")
+                format!(
+                    "{} compiling with embedded Tectonic…",
+                    SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+                )
             }
-            PipelineStatus::Rasterizing => String::from("rendering PDF page…"),
+            PipelineStatus::Rasterizing => format!(
+                "{} rendering PDF page…",
+                SPINNER_FRAMES[self.spinner_frame % SPINNER_FRAMES.len()]
+            ),
             PipelineStatus::Ready { elapsed, warnings } if *warnings > 0 => format!(
                 "ready in {} ms with {warnings} warning(s)",
                 elapsed.as_millis()
@@ -894,6 +1119,15 @@ impl App {
     }
 }
 
+fn contains(area: Rect, column: u16, row: u16) -> bool {
+    area.width > 0
+        && area.height > 0
+        && column >= area.x
+        && column < area.x.saturating_add(area.width)
+        && row >= area.y
+        && row < area.y.saturating_add(area.height)
+}
+
 fn pipeline_worker(requests: mpsc::Receiver<WorkerRequest>, events: mpsc::Sender<WorkerEvent>) {
     while let Ok(mut request) = requests.recv() {
         while let Ok(newer) = requests.try_recv() {
@@ -903,11 +1137,36 @@ fn pipeline_worker(requests: mpsc::Receiver<WorkerRequest>, events: mpsc::Sender
         match request {
             WorkerRequest::Compile {
                 revision,
-                document,
+                source,
                 page_index,
                 target_width,
             } => {
                 let started = Instant::now();
+                let words = source.split_whitespace().count();
+                let document = match Document::parse(&source) {
+                    Ok(document) => emit_latex(&document),
+                    Err(error) => {
+                        let byte = match &error {
+                            crate::note::NoteError::InvalidMath { byte, .. } => *byte,
+                        };
+                        let _ = events.send(WorkerEvent::ParseFailed {
+                            revision,
+                            message: error.to_string(),
+                            byte,
+                        });
+                        continue;
+                    }
+                };
+                if events
+                    .send(WorkerEvent::Built {
+                        revision,
+                        document: document.clone(),
+                        words,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
                 match compile_latex(CompileRequest::new(revision, &document)) {
                     Ok(output) => {
                         let warnings = output
@@ -1087,6 +1346,114 @@ mod tests {
     }
 
     #[test]
+    fn f2_toggles_distraction_free_zen_mode() {
+        let mut app = App::default();
+        assert!(!app.zen_mode());
+        app.handle_key(press(KeyCode::F(2)));
+        assert!(app.zen_mode());
+        app.handle_key(press(KeyCode::F(2)));
+        assert!(!app.zen_mode());
+    }
+
+    #[test]
+    fn mouse_click_focuses_panels_and_places_the_source_cursor() {
+        let mut app = App::default();
+        app.buffer.insert_str("abc\ndef");
+        app.mark_edited();
+        app.configure_pane_areas(
+            Rect::new(0, 0, 40, 10),
+            Rect::new(40, 0, 30, 10),
+            Rect::new(70, 0, 30, 10),
+        );
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 6,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus(), PaneFocus::Source);
+        assert_eq!(app.cursor_line_column(), (1, 3));
+
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 45,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(app.focus(), PaneFocus::Latex);
+    }
+
+    #[test]
+    fn settled_source_is_built_on_the_worker_not_the_typing_path() {
+        let mut app = App::default();
+        app.buffer.insert_str("x plus y");
+        app.mark_edited();
+
+        assert_eq!(app.generated_revision, None);
+        assert!(matches!(app.status, PipelineStatus::Waiting));
+        assert_eq!(app.source_stats().0, 8);
+
+        app.last_edit = Instant::now() - COMPILE_DEBOUNCE;
+        assert!(app.maybe_submit_compile());
+        for _ in 0..100 {
+            app.process_background_events();
+            if app.generated_revision == Some(app.revision) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(app.generated_revision, Some(app.revision));
+        assert_eq!(app.source_stats().1, Some(3));
+    }
+
+    #[test]
+    fn background_parse_errors_map_back_to_the_source() {
+        let mut app = App::default();
+        app.buffer.insert_str("$$\nx");
+        app.mark_edited();
+        app.last_edit = Instant::now() - COMPILE_DEBOUNCE;
+        assert!(app.maybe_submit_compile());
+
+        for _ in 0..100 {
+            app.process_background_events();
+            if matches!(app.status, PipelineStatus::Error(_)) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(app.status, PipelineStatus::Error(_)));
+        assert_eq!(app.diagnostic_line(), Some(0));
+    }
+
+    #[test]
+    fn event_polling_is_slow_when_idle_and_fast_during_pipeline_work() {
+        let mut app = App::default();
+        assert_eq!(app.poll_interval(), IDLE_POLL_INTERVAL);
+
+        app.buffer.insert_str("x");
+        app.mark_edited();
+        assert!(app.poll_interval() <= COMPILE_DEBOUNCE);
+
+        app.last_edit = Instant::now() - COMPILE_DEBOUNCE;
+        assert!(app.maybe_submit_compile());
+        assert_eq!(app.poll_interval(), ACTIVE_POLL_INTERVAL);
+    }
+
+    #[test]
+    fn deleting_the_last_visible_character_restores_empty_state() {
+        let mut app = App::default();
+        app.buffer.insert_char('x');
+        app.mark_edited();
+        assert!(matches!(app.status, PipelineStatus::Waiting));
+
+        assert!(app.buffer.backspace());
+        app.mark_edited();
+        assert!(matches!(app.status, PipelineStatus::Empty));
+        assert_eq!(app.source_stats(), (0, Some(0), 1));
+    }
+
+    #[test]
     fn blank_notes_do_not_submit_a_compile() {
         let mut app = App::default();
         app.maybe_submit_compile();
@@ -1120,6 +1487,7 @@ mod tests {
                 240,
                 Rgba([255, 255, 255, 255]),
             ))),
+            full_page_revision: Some(1),
             ..App::default()
         };
 
@@ -1128,6 +1496,11 @@ mod tests {
         wait_for_staged_preview(&mut app);
         assert!(app.has_preview());
 
+        app.install_visible_preview();
+        assert!(!app.staging_preview);
+
+        app.revision = app.revision.wrapping_add(1);
+        app.full_page_revision = Some(app.revision);
         app.full_page = Some(DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
             320,
             240,

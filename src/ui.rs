@@ -2,7 +2,10 @@ use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    StatefulWidget, Wrap,
+};
 use ratatui_image::StatefulImage;
 
 use crate::App;
@@ -21,8 +24,9 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
         Constraint::Fill(1),
         Constraint::Length(1),
     ]));
-    let panes = layout::split(content_area, app.focus());
+    let panes = layout::split(content_area, app.focus(), app.zen_mode());
 
+    app.configure_pane_areas(panes.source, panes.latex, panes.preview);
     let source_inner = render_source(frame, app, panes.source, &theme);
     let latex_inner = render_generated_latex(frame, app, panes.latex, &theme);
     let preview_inner = render_preview(frame, app, panes.preview, &theme);
@@ -39,15 +43,19 @@ pub(crate) fn render(frame: &mut Frame, app: &mut App) {
 }
 
 fn render_source(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rect {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Natural note ")
-        .border_style(pane_border(theme, app.focus() == PaneFocus::Source));
+    let focused = app.focus() == PaneFocus::Source;
+    let block = panel_block(" ◈ NATURAL NOTE ", focused, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
         return inner;
     }
+
+    let gutter_width = source_gutter_width(app.source_line_count(), inner.width);
+    let [gutter, content] = inner.layout(&Layout::horizontal([
+        Constraint::Length(gutter_width),
+        Constraint::Min(1),
+    ]));
 
     let diagnostic_line = app.diagnostic_line();
     let (scroll_y, scroll_x) = app.source_scroll();
@@ -65,25 +73,63 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rec
             Line::styled(app.source_line(line_index), style)
         })
         .collect();
+    let gutter_lines: Vec<Line<'static>> = (first_line..end_line)
+        .map(|line_index| {
+            let style = if diagnostic_line == Some(line_index) {
+                Style::default()
+                    .fg(theme.background)
+                    .bg(theme.error)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(if line_index == app.cursor_line_column().0 {
+                    theme.cursor
+                } else {
+                    theme.muted
+                })
+            };
+            Line::styled(
+                format!(
+                    "{:>width$} ",
+                    line_index + 1,
+                    width = usize::from(gutter_width.saturating_sub(1))
+                ),
+                style,
+            )
+        })
+        .collect();
     frame.render_widget(
-        Paragraph::new(Text::from(lines)).scroll((0, scroll_x)),
-        inner,
+        Paragraph::new(Text::from(gutter_lines)).style(Style::default().bg(theme.selection)),
+        gutter,
+    );
+    frame.render_widget(
+        Paragraph::new(Text::from(lines))
+            .style(Style::default().bg(theme.background))
+            .scroll((0, scroll_x)),
+        content,
     );
 
-    if app.focus() == PaneFocus::Source {
+    if focused {
         let (cursor_x, cursor_y) = app.cursor_screen_position();
-        if cursor_x < inner.width && cursor_y < inner.height {
-            frame.set_cursor_position(Position::new(inner.x + cursor_x, inner.y + cursor_y));
+        if cursor_x < content.width && cursor_y < content.height {
+            frame.set_cursor_position(Position::new(content.x + cursor_x, content.y + cursor_y));
         }
     }
-    inner
+    render_scrollbar(
+        frame,
+        area,
+        app.source_line_count(),
+        usize::from(scroll_y),
+        theme,
+    );
+    content
 }
 
 fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) -> Rect {
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Generated LaTeX body ")
-        .border_style(pane_border(theme, app.focus() == PaneFocus::Latex));
+    let block = panel_block(
+        " λ GENERATED LATEX ",
+        app.focus() == PaneFocus::Latex,
+        theme,
+    );
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -97,7 +143,7 @@ fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect, theme: &Them
             Style::default().fg(theme.muted),
         ))
     } else {
-        Paragraph::new(body)
+        Paragraph::new(body).style(Style::default().fg(theme.foreground))
     };
     frame.render_widget(
         paragraph
@@ -111,14 +157,11 @@ fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect, theme: &Them
 
 fn render_preview(frame: &mut Frame, app: &mut App, area: Rect, theme: &Theme) -> Rect {
     let title = format!(
-        " LaTeX document · {} · {} ",
+        " ▣ DOCUMENT PREVIEW  │  {}  │  {} ",
         app.page_label(),
         app.protocol_label()
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(pane_border(theme, app.focus() == PaneFocus::Preview));
+    let block = panel_block(title, app.focus() == PaneFocus::Preview, theme);
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -146,10 +189,16 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
         area,
     );
 
-    let hints = if area.width >= 72 {
-        "F1 help  F6 panes  Esc quit"
+    let hints = if area.width >= 100 {
+        match app.focus() {
+            PaneFocus::Source => " F1 HELP │ F2 ZEN │ F6 PANES │ TAB INDENT ",
+            PaneFocus::Latex => " F1 HELP │ H/L PANES │ J/K SCROLL │ HOME/END ",
+            PaneFocus::Preview => " F1 HELP │ H/L PANES │ J/K SCROLL │ PGUP/PGDN PAGE ",
+        }
+    } else if area.width >= 72 {
+        " F1 HELP │ F2 ZEN │ F6 PANES "
     } else if area.width >= 50 {
-        "F1 help  F6"
+        " F1 HELP │ F6 PANES "
     } else {
         ""
     };
@@ -171,24 +220,43 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
     } else {
         theme.warning
     };
-    let line = Line::from(vec![
-        Span::styled(
-            " EDIT ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" "),
-        Span::styled(
-            app.focus_label(),
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(status, Style::default().fg(status_color)),
-    ]);
+    let separator = || Span::styled(" │ ", Style::default().fg(theme.inactive));
+    let mut spans = vec![Span::styled(
+        if app.zen_mode() { " ZEN " } else { " EDIT " },
+        Style::default()
+            .fg(theme.background)
+            .bg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    )];
+    spans.push(Span::raw(" "));
+    spans.push(Span::styled(
+        app.focus_label(),
+        Style::default()
+            .fg(theme.accent)
+            .add_modifier(Modifier::BOLD),
+    ));
+    if area.width >= 70 {
+        let (line, column) = app.cursor_line_column();
+        spans.push(separator());
+        spans.push(Span::styled(
+            format!("LN {}  COL {}", line + 1, column + 1),
+            Style::default().fg(theme.foreground),
+        ));
+    }
+    if area.width >= 112 {
+        let (characters, words, lines) = app.source_stats();
+        spans.push(separator());
+        spans.push(Span::styled(
+            words.map_or_else(
+                || format!("{characters} CHARS · {lines} LINES"),
+                |words| format!("{characters} CHARS · {words} WORDS · {lines} LINES"),
+            ),
+            Style::default().fg(theme.muted),
+        ));
+    }
+    spans.push(separator());
+    spans.push(Span::styled(status, Style::default().fg(status_color)));
+    let line = Line::from(spans);
     frame.render_widget(Paragraph::new(line), left);
     if !hints.is_empty() {
         frame.render_widget(
@@ -201,29 +269,42 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect, theme: &Theme) {
 }
 
 fn render_help(frame: &mut Frame, theme: &Theme) {
-    let area = centered_rect(frame.area(), 72, 15);
+    let area = centered_rect(
+        frame.area(),
+        frame.area().width.saturating_mul(4) / 5,
+        frame.area().height.saturating_mul(4) / 5,
+    );
     frame.render_widget(Clear, area);
     let help = Text::from(vec![
-        Line::from("Editing"),
-        Line::from("  Type normally · Tab inserts four spaces · Ctrl-U clears"),
-        Line::from("  Arrow keys, Home, End, Backspace, Delete"),
+        help_heading("GLOBAL", theme),
+        help_binding("F1", "toggle command reference", theme),
+        help_binding("F2", "toggle distraction-free zen mode", theme),
+        help_binding("F6 / Shift-F6", "cycle panes forward / backward", theme),
+        help_binding("Esc / Ctrl-C", "quit mathnote", theme),
         Line::from(""),
-        Line::from("Panes"),
-        Line::from("  F6 / Shift-F6 cycles Source, LaTeX, and Preview"),
-        Line::from("  In inspector panes: h/l changes focus, j/k scrolls"),
-        Line::from("  PageUp/PageDown changes PDF pages in Preview"),
+        help_heading("EDITOR", theme),
+        help_binding("Tab", "insert four spaces", theme),
+        help_binding("Arrows / Home / End", "move the editing cursor", theme),
+        help_binding("Ctrl-U", "clear the note", theme),
         Line::from(""),
-        Line::from("Global"),
-        Line::from("  F1 closes help · Esc or Ctrl-C quits"),
+        help_heading("INSPECTORS", theme),
+        help_binding("h / l", "move between panes", theme),
+        help_binding("j / k or arrows", "scroll the focused pane", theme),
+        help_binding(
+            "PageUp / PageDown",
+            "scroll LaTeX or change PDF page",
+            theme,
+        ),
+        Line::from(""),
+        help_heading("MOUSE", theme),
+        help_binding("Click", "focus a pane or place the source cursor", theme),
+        help_binding("Wheel", "scroll the pane under the pointer", theme),
     ]);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" mathnote help ")
-        .border_style(Style::default().fg(theme.border));
+    let block = panel_block(" ⌨ COMMAND REFERENCE  │  F1 / ESC CLOSE ", true, theme);
     frame.render_widget(
         Paragraph::new(help)
             .block(block)
-            .style(Style::default().fg(theme.foreground))
+            .style(Style::default().fg(theme.foreground).bg(theme.background))
             .wrap(Wrap { trim: false }),
         area,
     );
@@ -240,12 +321,61 @@ fn centered_rect(area: Rect, preferred_width: u16, preferred_height: u16) -> Rec
     )
 }
 
-fn pane_border(theme: &Theme, focused: bool) -> Style {
-    Style::default().fg(if focused {
-        theme.accent
-    } else {
-        theme.inactive
-    })
+fn panel_block<'a>(title: impl Into<Line<'a>>, focused: bool, theme: &Theme) -> Block<'a> {
+    Block::default()
+        .title(title)
+        .title_style(
+            Style::default()
+                .fg(theme.panel_title)
+                .add_modifier(Modifier::BOLD),
+        )
+        .borders(Borders::ALL)
+        .border_type(if focused {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        })
+        .border_style(Style::default().fg(if focused { theme.accent } else { theme.border }))
+        .style(Style::default().bg(theme.background).fg(theme.foreground))
+}
+
+pub(crate) fn source_gutter_width(line_count: usize, available: u16) -> u16 {
+    let digits = line_count.max(1).ilog10() as u16 + 1;
+    digits.saturating_add(1).min(available.saturating_sub(1))
+}
+
+fn render_scrollbar(frame: &mut Frame, area: Rect, total: usize, position: usize, theme: &Theme) {
+    if total <= usize::from(area.height.saturating_sub(2)) {
+        return;
+    }
+    let mut state = ScrollbarState::new(total).position(position);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(None)
+        .style(Style::default().fg(theme.scrollbar));
+    frame.render_stateful_widget(scrollbar, area, &mut state);
+}
+
+fn help_heading(label: &'static str, theme: &Theme) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("── {label} ──"),
+        Style::default()
+            .fg(theme.highlight)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn help_binding(key: &'static str, label: &'static str, theme: &Theme) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("  {key:>18}  "),
+            Style::default()
+                .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label, Style::default().fg(theme.foreground)),
+    ])
 }
 
 #[cfg(test)]
@@ -282,28 +412,48 @@ mod tests {
     #[test]
     fn status_bar_replaces_the_static_header() {
         let screen = render_screen(100, 24, false);
-        assert!(screen.contains("Natural note"));
-        assert!(screen.contains("Generated LaTeX body"));
-        assert!(screen.contains("LaTeX document"));
+        assert!(screen.contains("NATURAL NOTE"));
+        assert!(screen.contains("GENERATED LATEX"));
+        assert!(screen.contains("DOCUMENT PREVIEW"));
         assert!(screen.contains("EDIT"));
         assert!(screen.contains("SOURCE"));
-        assert!(screen.contains("F1 help"));
+        assert!(screen.contains("F1 HELP"));
+        assert!(screen.contains("TAB INDENT"));
         assert!(!screen.contains("natural-language mathematics"));
     }
 
     #[test]
     fn help_overlay_is_visible_in_the_rendered_buffer() {
         let screen = render_screen(100, 24, true);
-        assert!(screen.contains("mathnote help"));
-        assert!(screen.contains("Shift-F6 cycles"));
-        assert!(screen.contains("PageUp/PageDown"));
+        assert!(screen.contains("COMMAND REFERENCE"));
+        assert!(screen.contains("F6 / Shift-F6"));
+        assert!(screen.contains("PageUp / PageDown"));
+        assert!(screen.contains("MOUSE"));
     }
 
     #[test]
     fn narrow_layout_keeps_all_panes_available() {
         let screen = render_screen(50, 18, false);
-        assert!(screen.contains("Natural note"));
-        assert!(screen.contains("Generated LaTeX body"));
-        assert!(screen.contains("LaTeX document"));
+        assert!(screen.contains("NATURAL NOTE"));
+        assert!(screen.contains("GENERATED LATEX"));
+        assert!(screen.contains("DOCUMENT PREVIEW"));
+    }
+
+    #[test]
+    fn rendered_cells_use_cyberpunk_surface_and_focus_colors() {
+        let backend = TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        let mut app = App::default();
+        terminal
+            .draw(|frame| render(frame, &mut app))
+            .expect("render succeeds");
+
+        let theme = Theme::default();
+        let buffer = terminal.backend().buffer();
+        let focused_border = buffer.cell((0, 0)).expect("focused border cell");
+        assert_eq!(focused_border.fg, theme.accent);
+        assert_eq!(focused_border.bg, theme.background);
+        let status = buffer.cell((99, 23)).expect("status cell");
+        assert_eq!(status.bg, theme.status_background);
     }
 }

@@ -9,12 +9,12 @@ pub(crate) struct PaneAreas {
 }
 
 const COLLAPSED: u16 = 1;
-const STACK_WIDTH: u16 = 90;
+const STACK_WIDTH: u16 = 70;
 const SINGLE_WIDTH: u16 = 46;
-const SINGLE_HEIGHT: u16 = 11;
+const SINGLE_HEIGHT: u16 = 14;
 
-pub(crate) fn split(area: Rect, focus: PaneFocus) -> PaneAreas {
-    if area.width < SINGLE_WIDTH || area.height < SINGLE_HEIGHT {
+pub(crate) fn split(area: Rect, focus: PaneFocus, zen_mode: bool) -> PaneAreas {
+    if zen_mode || area.width < SINGLE_WIDTH || area.height < SINGLE_HEIGHT {
         return single(area, focus);
     }
     if area.width < STACK_WIDTH {
@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn wide_layout_uses_three_columns() {
-        let areas = split(Rect::new(0, 0, 120, 30), PaneFocus::Source);
+        let areas = split(Rect::new(0, 0, 120, 30), PaneFocus::Source, false);
         assert!(areas.source.width > 0);
         assert!(areas.latex.width > 0);
         assert!(areas.preview.width > 0);
@@ -108,10 +108,10 @@ mod tests {
 
     #[test]
     fn narrow_layout_stacks_full_width_panels() {
-        let areas = split(Rect::new(0, 0, 80, 24), PaneFocus::Source);
-        assert_eq!(areas.source.width, 80);
-        assert_eq!(areas.latex.width, 80);
-        assert_eq!(areas.preview.width, 80);
+        let areas = split(Rect::new(0, 0, 60, 24), PaneFocus::Source, false);
+        assert_eq!(areas.source.width, 60);
+        assert_eq!(areas.latex.width, 60);
+        assert_eq!(areas.preview.width, 60);
         assert!(areas.source.y < areas.latex.y);
         assert!(areas.latex.y < areas.preview.y);
     }
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn tiny_layout_only_shows_the_focused_panel() {
         let area = Rect::new(0, 0, 45, 10);
-        let areas = split(area, PaneFocus::Preview);
+        let areas = split(area, PaneFocus::Preview, false);
         assert_eq!(areas.source.width, 0);
         assert_eq!(areas.latex.width, 0);
         assert_eq!(areas.preview, area);
@@ -127,9 +127,18 @@ mod tests {
 
     #[test]
     fn preview_focus_collapses_sibling_columns() {
-        let areas = split(Rect::new(0, 0, 120, 30), PaneFocus::Preview);
+        let areas = split(Rect::new(0, 0, 120, 30), PaneFocus::Preview, false);
         assert_eq!(areas.source.width, COLLAPSED);
         assert_eq!(areas.latex.width, COLLAPSED);
         assert_eq!(areas.preview.width, 120 - COLLAPSED * 2);
+    }
+
+    #[test]
+    fn zen_mode_only_shows_the_focused_panel() {
+        let area = Rect::new(0, 0, 120, 30);
+        let areas = split(area, PaneFocus::Latex, true);
+        assert_eq!(areas.source.width, 0);
+        assert_eq!(areas.latex, area);
+        assert_eq!(areas.preview.width, 0);
     }
 }
