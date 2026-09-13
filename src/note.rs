@@ -41,6 +41,8 @@ pub struct NoteLine {
 impl NoteLine {
     /// Parses one mixed note line. Ordinary language remains prose while
     /// complete, unambiguous mathematical phrases are detected and rendered.
+    /// Automatically inferred expressions are limited to 256 source bytes;
+    /// longer expressions must use explicit `$...$` delimiters.
     pub fn parse(input: &str) -> Result<Self, NoteError> {
         validate_explicit_math_delimiters(input)?;
         let mut segments = Vec::new();
@@ -207,18 +209,32 @@ fn push_text_segment(segments: &mut Vec<NoteSegment>, text: &str) {
     }
 }
 
+// This keeps heuristic range discovery bounded per token. Explicit inline and
+// display mathematics bypass automatic discovery and are intentionally uncapped.
+const MAX_AUTOMATIC_MATH_BYTES: usize = 256;
+
 fn discover_math_ranges(input: &str) -> Vec<Range<usize>> {
     let clauses = tokenize_clauses(input);
     let mut ranges = Vec::new();
 
     for tokens in clauses {
-        if has_ambiguous_root_scope(&tokens, input) {
+        let clause = tokens[0].span.start..tokens[tokens.len() - 1].span.end;
+        if !contains_math_trigger(&input[clause]) || has_ambiguous_root_scope(&tokens, input) {
             continue;
         }
         let mut start = 0;
+        let mut bounded_end = 0;
         while start < tokens.len() {
+            bounded_end = bounded_end.max(start);
+            while bounded_end < tokens.len()
+                && tokens[bounded_end].span.end - tokens[start].span.start
+                    <= MAX_AUTOMATIC_MATH_BYTES
+            {
+                bounded_end += 1;
+            }
+
             let mut selected = None;
-            for end in (start + 1..=tokens.len()).rev() {
+            for end in (start + 1..=bounded_end).rev() {
                 let range = tokens[start].span.start..tokens[end - 1].span.end;
                 let candidate = &input[range.clone()];
                 if is_complete_math_candidate(candidate)

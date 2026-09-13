@@ -39,6 +39,54 @@ fn incomplete_math_language_remains_prose() {
 }
 
 #[test]
+fn long_trigger_free_clause_remains_prose() {
+    let input = vec!["ordinary"; 10_000].join(" ");
+    let note = NoteLine::parse(&input).expect("long prose clause parses");
+
+    assert!(matches!(
+        note.segments(),
+        [NoteSegment::Text(text)] if text == &input
+    ));
+}
+
+#[test]
+fn long_clause_still_finds_a_short_automatic_expression() {
+    let prose = vec!["ordinary"; 10_000].join(" ");
+    let input = format!("{prose} x + y");
+    let note = NoteLine::parse(&input).expect("long mixed clause parses");
+
+    assert!(matches!(
+        note.segments(),
+        [NoteSegment::Text(text), NoteSegment::Math(math)]
+            if text == &format!("{prose} ")
+                && math.source() == "x + y"
+                && math.latex() == "x + y"
+    ));
+}
+
+#[test]
+fn automatic_length_bound_is_fail_closed_without_limiting_explicit_math() {
+    let digits = "1".repeat(300);
+    let expression = format!("root of {digits}");
+
+    let automatic = NoteLine::parse(&expression).expect("oversized automatic input stays prose");
+    assert!(matches!(
+        automatic.segments(),
+        [NoteSegment::Text(text)] if text == &expression
+    ));
+
+    let explicit_input = format!("${expression}$");
+    let explicit =
+        NoteLine::parse(&explicit_input).expect("explicit math bypasses heuristic bound");
+    assert!(matches!(
+        explicit.segments(),
+        [NoteSegment::Math(math)]
+            if math.source() == expression
+                && math.latex() == format!(r"\sqrt{{{digits}}}")
+    ));
+}
+
+#[test]
 fn display_math_and_source_spans_form_one_document_model() {
     let input = "A proof begins here.\n\n$$\nx squared plus y squared equals z squared\n$$\n";
     let document = Document::parse(input).expect("display math document");
