@@ -6,36 +6,27 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, StatefulWidget, Wrap};
 use ratatui_image::StatefulImage;
 
 use crate::App;
-
-const MIN_WIDTH: u16 = 90;
-const MIN_HEIGHT: u16 = 24;
+use crate::app::PaneFocus;
+use crate::layout;
 
 pub(crate) fn render(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        render_too_small(frame, area);
-        return;
-    }
-
     let [header_area, content_area, status_area] = area.layout(&Layout::vertical([
         Constraint::Length(2),
         Constraint::Fill(1),
         Constraint::Length(1),
     ]));
-    let [left_area, preview_area] = content_area.layout(&Layout::horizontal([
-        Constraint::Percentage(45),
-        Constraint::Percentage(55),
-    ]));
-    let [source_area, latex_area] = left_area.layout(&Layout::vertical([
-        Constraint::Percentage(70),
-        Constraint::Percentage(30),
-    ]));
+    let panes = layout::split(content_area, app.focus());
 
     render_header(frame, header_area);
-    let source_inner = render_source(frame, app, source_area);
-    render_generated_latex(frame, app, latex_area);
-    let preview_inner = render_preview(frame, app, preview_area);
-    app.configure_layout(source_inner.into(), preview_inner.into());
+    let source_inner = render_source(frame, app, panes.source);
+    let latex_inner = render_generated_latex(frame, app, panes.latex);
+    let preview_inner = render_preview(frame, app, panes.preview);
+    app.configure_layout(
+        source_inner.into(),
+        latex_inner.into(),
+        preview_inner.into(),
+    );
     render_status(frame, app, status_area);
 }
 
@@ -49,8 +40,10 @@ fn render_header(frame: &mut Frame, area: Rect) {
         ),
         Span::raw("  natural-language mathematics → live LaTeX document"),
     ]);
-    let help = Line::from("Ctrl-U clear  Ctrl-↑/↓ preview scroll  PgUp/PgDn pages  Esc quit")
-        .style(Style::default().fg(Color::DarkGray));
+    let help = Line::from(
+        "F6 panes  Ctrl-U clear  inspector: h/l focus · j/k scroll  PgUp/PgDn pages  Esc quit",
+    )
+    .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(Paragraph::new(vec![title, help]), area);
 }
 
@@ -58,7 +51,7 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Natural note ")
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(pane_border(app.focus() == PaneFocus::Source));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -82,22 +75,24 @@ fn render_source(frame: &mut Frame, app: &App, area: Rect) -> Rect {
         inner,
     );
 
-    let (cursor_x, cursor_y) = app.cursor_screen_position();
-    if cursor_x < inner.width && cursor_y < inner.height {
-        frame.set_cursor_position(Position::new(inner.x + cursor_x, inner.y + cursor_y));
+    if app.focus() == PaneFocus::Source {
+        let (cursor_x, cursor_y) = app.cursor_screen_position();
+        if cursor_x < inner.width && cursor_y < inner.height {
+            frame.set_cursor_position(Position::new(inner.x + cursor_x, inner.y + cursor_y));
+        }
     }
     inner
 }
 
-fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect) {
+fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(" Generated LaTeX body ")
-        .border_style(Style::default().fg(Color::DarkGray));
+        .border_style(pane_border(app.focus() == PaneFocus::Latex));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return inner;
     }
 
     let body = app.generated_body();
@@ -112,9 +107,11 @@ fn render_generated_latex(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(content)
             .style(Style::default().fg(Color::Gray))
-            .wrap(Wrap { trim: false }),
+            .wrap(Wrap { trim: false })
+            .scroll((app.latex_scroll(), 0)),
         inner,
     );
+    inner
 }
 
 fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) -> Rect {
@@ -126,7 +123,7 @@ fn render_preview(frame: &mut Frame, app: &mut App, area: Rect) -> Rect {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(title)
-        .border_style(Style::default().fg(Color::Cyan));
+        .border_style(pane_border(app.focus() == PaneFocus::Preview));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -160,20 +157,10 @@ fn render_status(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(status).style(style), area);
 }
 
-fn render_too_small(frame: &mut Frame, area: Rect) {
-    let message = format!(
-        "mathnote needs at least {MIN_WIDTH}×{MIN_HEIGHT} cells\ncurrent terminal: {}×{}",
-        area.width, area.height
-    );
-    frame.render_widget(
-        Paragraph::new(message)
-            .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::Yellow))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Resize terminal "),
-            ),
-        area,
-    );
+fn pane_border(focused: bool) -> Style {
+    Style::default().fg(if focused {
+        Color::Cyan
+    } else {
+        Color::DarkGray
+    })
 }

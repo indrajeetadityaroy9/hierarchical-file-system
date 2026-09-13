@@ -1,0 +1,135 @@
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
+
+use crate::app::PaneFocus;
+
+pub(crate) struct PaneAreas {
+    pub source: Rect,
+    pub latex: Rect,
+    pub preview: Rect,
+}
+
+const COLLAPSED: u16 = 1;
+const STACK_WIDTH: u16 = 90;
+const SINGLE_WIDTH: u16 = 46;
+const SINGLE_HEIGHT: u16 = 11;
+
+pub(crate) fn split(area: Rect, focus: PaneFocus) -> PaneAreas {
+    if area.width < SINGLE_WIDTH || area.height < SINGLE_HEIGHT {
+        return single(area, focus);
+    }
+    if area.width < STACK_WIDTH {
+        return stacked(area, focus);
+    }
+    columned(area, focus)
+}
+
+fn columned(area: Rect, focus: PaneFocus) -> PaneAreas {
+    let (source, latex, preview) = constraints(focus);
+    let columns = Layout::default()
+        .direction(Direction::Horizontal)
+        .spacing(0)
+        .constraints([source, latex, preview])
+        .split(area);
+    PaneAreas {
+        source: columns[0],
+        latex: columns[1],
+        preview: columns[2],
+    }
+}
+
+fn stacked(area: Rect, focus: PaneFocus) -> PaneAreas {
+    let (source, latex, preview) = constraints(focus);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .spacing(0)
+        .constraints([source, latex, preview])
+        .split(area);
+    PaneAreas {
+        source: rows[0],
+        latex: rows[1],
+        preview: rows[2],
+    }
+}
+
+fn single(area: Rect, focus: PaneFocus) -> PaneAreas {
+    let zero = Rect::new(area.x, area.y, 0, 0);
+    match focus {
+        PaneFocus::Source => PaneAreas {
+            source: area,
+            latex: zero,
+            preview: zero,
+        },
+        PaneFocus::Latex => PaneAreas {
+            source: zero,
+            latex: area,
+            preview: zero,
+        },
+        PaneFocus::Preview => PaneAreas {
+            source: zero,
+            latex: zero,
+            preview: area,
+        },
+    }
+}
+
+fn constraints(focus: PaneFocus) -> (Constraint, Constraint, Constraint) {
+    match focus {
+        PaneFocus::Source => (
+            Constraint::Fill(7),
+            Constraint::Fill(5),
+            Constraint::Fill(8),
+        ),
+        PaneFocus::Latex => (
+            Constraint::Length(COLLAPSED),
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+        ),
+        PaneFocus::Preview => (
+            Constraint::Length(COLLAPSED),
+            Constraint::Length(COLLAPSED),
+            Constraint::Fill(1),
+        ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_layout_uses_three_columns() {
+        let areas = split(Rect::new(0, 0, 120, 30), PaneFocus::Source);
+        assert!(areas.source.width > 0);
+        assert!(areas.latex.width > 0);
+        assert!(areas.preview.width > 0);
+        assert_eq!(areas.source.y, areas.latex.y);
+        assert_eq!(areas.latex.y, areas.preview.y);
+    }
+
+    #[test]
+    fn narrow_layout_stacks_full_width_panels() {
+        let areas = split(Rect::new(0, 0, 80, 24), PaneFocus::Source);
+        assert_eq!(areas.source.width, 80);
+        assert_eq!(areas.latex.width, 80);
+        assert_eq!(areas.preview.width, 80);
+        assert!(areas.source.y < areas.latex.y);
+        assert!(areas.latex.y < areas.preview.y);
+    }
+
+    #[test]
+    fn tiny_layout_only_shows_the_focused_panel() {
+        let area = Rect::new(0, 0, 45, 10);
+        let areas = split(area, PaneFocus::Preview);
+        assert_eq!(areas.source.width, 0);
+        assert_eq!(areas.latex.width, 0);
+        assert_eq!(areas.preview, area);
+    }
+
+    #[test]
+    fn preview_focus_collapses_sibling_columns() {
+        let areas = split(Rect::new(0, 0, 120, 30), PaneFocus::Preview);
+        assert_eq!(areas.source.width, COLLAPSED);
+        assert_eq!(areas.latex.width, COLLAPSED);
+        assert_eq!(areas.preview.width, 120 - COLLAPSED * 2);
+    }
+}

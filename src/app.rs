@@ -26,6 +26,7 @@ const DEFAULT_RASTER_WIDTH: u32 = 800;
 pub struct App {
     buffer: TextBuffer,
     should_quit: bool,
+    focus: PaneFocus,
     revision: u64,
     generated_revision: Option<u64>,
     generated: Option<LatexDocument>,
@@ -50,8 +51,35 @@ pub struct App {
     source_size: Size,
     source_scroll_y: usize,
     source_scroll_x: u16,
+    latex_size: Size,
+    latex_scroll_rows: u16,
     preview_size: Size,
     preview_scroll_rows: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneFocus {
+    Source,
+    Latex,
+    Preview,
+}
+
+impl PaneFocus {
+    fn next(self) -> Self {
+        match self {
+            Self::Source => Self::Latex,
+            Self::Latex => Self::Preview,
+            Self::Preview => Self::Source,
+        }
+    }
+
+    fn previous(self) -> Self {
+        match self {
+            Self::Source => Self::Preview,
+            Self::Latex => Self::Source,
+            Self::Preview => Self::Latex,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +158,7 @@ impl App {
         let mut app = Self {
             buffer,
             should_quit: false,
+            focus: PaneFocus::Source,
             revision: 1,
             generated_revision: None,
             generated: None,
@@ -152,6 +181,8 @@ impl App {
             source_size: Size::default(),
             source_scroll_y: 0,
             source_scroll_x: 0,
+            latex_size: Size::default(),
+            latex_scroll_rows: 0,
             preview_size: Size::new(80, 24),
             preview_scroll_rows: 0,
         };
@@ -189,6 +220,16 @@ impl App {
             return;
         }
 
+        if key.code == KeyCode::F(6) {
+            self.focus = if key.modifiers.contains(KeyModifiers::SHIFT) {
+                self.focus.previous()
+            } else {
+                self.focus.next()
+            };
+            self.ensure_cursor_visible();
+            return;
+        }
+
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.should_quit = true;
             return;
@@ -204,6 +245,10 @@ impl App {
         }
         if key.code == KeyCode::Down && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.scroll_preview(3);
+            return;
+        }
+
+        if self.focus != PaneFocus::Source && self.handle_browse_key(key) {
             return;
         }
 
@@ -272,6 +317,109 @@ impl App {
         }
     }
 
+    fn handle_browse_key(&mut self, key: KeyEvent) -> bool {
+        let plain_character = |expected| {
+            key.code == KeyCode::Char(expected)
+                && !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        };
+
+        if plain_character('q') {
+            self.should_quit = true;
+            return true;
+        }
+        if key.code == KeyCode::Left || plain_character('h') {
+            self.focus = self.focus.previous();
+            self.ensure_cursor_visible();
+            return true;
+        }
+        if key.code == KeyCode::Right || key.code == KeyCode::Enter || plain_character('l') {
+            self.focus = self.focus.next();
+            self.ensure_cursor_visible();
+            return true;
+        }
+
+        match self.focus {
+            PaneFocus::Source => false,
+            PaneFocus::Latex => match key.code {
+                KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_latex(-1);
+                    true
+                }
+                KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_latex(1);
+                    true
+                }
+                KeyCode::PageUp => {
+                    self.scroll_latex(
+                        -i16::try_from(self.latex_size.height.max(1)).unwrap_or(i16::MAX),
+                    );
+                    true
+                }
+                KeyCode::PageDown => {
+                    self.scroll_latex(
+                        i16::try_from(self.latex_size.height.max(1)).unwrap_or(i16::MAX),
+                    );
+                    true
+                }
+                KeyCode::Home => {
+                    self.latex_scroll_rows = 0;
+                    true
+                }
+                KeyCode::End => {
+                    self.latex_scroll_rows = self.max_latex_scroll();
+                    true
+                }
+                KeyCode::Char('k') if plain_character('k') => {
+                    self.scroll_latex(-1);
+                    true
+                }
+                KeyCode::Char('j') if plain_character('j') => {
+                    self.scroll_latex(1);
+                    true
+                }
+                _ => false,
+            },
+            PaneFocus::Preview => match key.code {
+                KeyCode::Up if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_preview(-1);
+                    true
+                }
+                KeyCode::Down if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.scroll_preview(1);
+                    true
+                }
+                KeyCode::Char('k') if plain_character('k') => {
+                    self.scroll_preview(-1);
+                    true
+                }
+                KeyCode::Char('j') if plain_character('j') => {
+                    self.scroll_preview(1);
+                    true
+                }
+                KeyCode::PageUp => {
+                    self.change_page(-1);
+                    true
+                }
+                KeyCode::PageDown => {
+                    self.change_page(1);
+                    true
+                }
+                KeyCode::Home => {
+                    self.preview_scroll_rows = 0;
+                    self.install_visible_preview();
+                    true
+                }
+                KeyCode::End => {
+                    self.scroll_preview(i16::MAX);
+                    true
+                }
+                _ => false,
+            },
+        }
+    }
+
     fn mark_edited(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         self.last_edit = Instant::now();
@@ -288,6 +436,7 @@ impl App {
             Ok(document) => {
                 self.generated = Some(emit_latex(&document));
                 self.generated_revision = Some(self.revision);
+                self.latex_scroll_rows = 0;
                 self.status = PipelineStatus::Waiting;
                 self.diagnostic_span = None;
             }
@@ -468,6 +617,21 @@ impl App {
         self.install_visible_preview();
     }
 
+    fn scroll_latex(&mut self, rows: i16) {
+        self.latex_scroll_rows = self
+            .latex_scroll_rows
+            .saturating_add_signed(rows)
+            .min(self.max_latex_scroll());
+    }
+
+    fn max_latex_scroll(&self) -> u16 {
+        let line_count = self.generated_body().lines().count().max(1);
+        let viewport = usize::from(self.latex_size.height.max(1));
+        line_count
+            .saturating_sub(viewport)
+            .min(usize::from(u16::MAX)) as u16
+    }
+
     fn change_page(&mut self, delta: isize) {
         if self.page_count == 0 {
             return;
@@ -514,10 +678,17 @@ impl App {
         }
     }
 
-    pub(crate) fn configure_layout(&mut self, source_size: Size, preview_size: Size) {
+    pub(crate) fn configure_layout(
+        &mut self,
+        source_size: Size,
+        latex_size: Size,
+        preview_size: Size,
+    ) {
         let old_target = self.target_raster_width();
         self.source_size = source_size;
+        self.latex_size = latex_size;
         self.preview_size = preview_size;
+        self.latex_scroll_rows = self.latex_scroll_rows.min(self.max_latex_scroll());
         self.ensure_cursor_visible();
         if self.target_raster_width() != old_target {
             self.full_page_width = 0;
@@ -553,6 +724,14 @@ impl App {
 
     pub(crate) fn generated_body(&self) -> &str {
         self.generated.as_ref().map_or("", LatexDocument::body)
+    }
+
+    pub(crate) fn focus(&self) -> PaneFocus {
+        self.focus
+    }
+
+    pub(crate) fn latex_scroll(&self) -> u16 {
+        self.latex_scroll_rows
     }
 
     pub(crate) fn diagnostic_line(&self) -> Option<usize> {
@@ -748,4 +927,41 @@ fn extract_tex_line(log: &str) -> Option<usize> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn f6_cycles_focus_without_repurposing_tab() {
+        let mut app = App::default();
+        assert_eq!(app.focus(), PaneFocus::Source);
+
+        app.handle_key(press(KeyCode::F(6)));
+        assert_eq!(app.focus(), PaneFocus::Latex);
+        app.handle_key(press(KeyCode::F(6)));
+        assert_eq!(app.focus(), PaneFocus::Preview);
+        app.handle_key(press(KeyCode::F(6)));
+        assert_eq!(app.focus(), PaneFocus::Source);
+
+        app.handle_key(press(KeyCode::Tab));
+        assert_eq!(app.buffer.text(), "    ");
+    }
+
+    #[test]
+    fn inspector_navigation_uses_h_and_l_for_focus() {
+        let mut app = App::default();
+        app.handle_key(press(KeyCode::F(6)));
+        assert_eq!(app.focus(), PaneFocus::Latex);
+
+        app.handle_key(press(KeyCode::Char('l')));
+        assert_eq!(app.focus(), PaneFocus::Preview);
+        app.handle_key(press(KeyCode::Char('h')));
+        assert_eq!(app.focus(), PaneFocus::Latex);
+    }
 }
