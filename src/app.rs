@@ -10,6 +10,7 @@ use ratatui::layout::Size;
 use ratatui_image::errors::Errors as ImageError;
 use ratatui_image::picker::Picker;
 use ratatui_image::thread::{ResizeRequest, ResizeResponse, ThreadProtocol};
+use ratatui_image::{Resize, ResizeEncodeRender};
 
 use crate::compiler::{
     CompileError, CompileRequest, DiagnosticKind, cache_is_warmed, compile_latex,
@@ -39,8 +40,10 @@ pub struct App {
     diagnostic_span: Option<SourceSpan>,
 
     picker: Picker,
-    image_state: ThreadProtocol,
-    resize_rx: mpsc::Receiver<Result<ResizeResponse, ImageError>>,
+    active_image: ImageSlot,
+    staging_image: ImageSlot,
+    staging_preview: bool,
+    preview_visible: bool,
     pdf: Option<Arc<Vec<u8>>>,
     pdf_revision: Option<u64>,
     page_count: usize,
@@ -132,6 +135,29 @@ enum WorkerEvent {
     },
 }
 
+struct ImageSlot {
+    protocol: ThreadProtocol,
+    resize_rx: mpsc::Receiver<Result<ResizeResponse, ImageError>>,
+}
+
+impl ImageSlot {
+    fn new() -> Self {
+        let (resize_tx, resize_requests) = mpsc::channel::<ResizeRequest>();
+        let (resize_events, resize_rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(request) = resize_requests.recv() {
+                if resize_events.send(request.resize_encode()).is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            protocol: ThreadProtocol::new(resize_tx, None),
+            resize_rx,
+        }
+    }
+}
+
 impl Default for App {
     fn default() -> Self {
         Self::new(Picker::halfblocks())
@@ -145,16 +171,6 @@ impl App {
         let (worker_tx, worker_requests) = mpsc::channel();
         let (worker_events, worker_rx) = mpsc::channel();
         thread::spawn(move || pipeline_worker(worker_requests, worker_events));
-
-        let (resize_tx, resize_requests) = mpsc::channel::<ResizeRequest>();
-        let (resize_events, resize_rx) = mpsc::channel();
-        thread::spawn(move || {
-            while let Ok(request) = resize_requests.recv() {
-                if resize_events.send(request.resize_encode()).is_err() {
-                    break;
-                }
-            }
-        });
 
         let buffer = TextBuffer::default();
         let mut app = Self {
@@ -172,8 +188,10 @@ impl App {
             status: PipelineStatus::Waiting,
             diagnostic_span: None,
             picker,
-            image_state: ThreadProtocol::new(resize_tx, None),
-            resize_rx,
+            active_image: ImageSlot::new(),
+            staging_image: ImageSlot::new(),
+            staging_preview: false,
+            preview_visible: false,
             pdf: None,
             pdf_revision: None,
             page_count: 0,
@@ -552,13 +570,35 @@ impl App {
 
     fn process_background_events(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(result) = self.resize_rx.try_recv() {
+        while let Ok(result) = self.active_image.resize_rx.try_recv() {
             changed = true;
             match result {
                 Ok(response) => {
-                    self.image_state.update_resized_protocol(response);
+                    self.active_image.protocol.update_resized_protocol(response);
                 }
                 Err(error) => {
+                    self.status = PipelineStatus::Error(format!("terminal image error: {error}"));
+                }
+            }
+        }
+
+        while let Ok(result) = self.staging_image.resize_rx.try_recv() {
+            changed = true;
+            match result {
+                Ok(response) => {
+                    if self
+                        .staging_image
+                        .protocol
+                        .update_resized_protocol(response)
+                        && self.staging_preview
+                    {
+                        std::mem::swap(&mut self.active_image, &mut self.staging_image);
+                        self.staging_preview = false;
+                        self.preview_visible = true;
+                    }
+                }
+                Err(error) => {
+                    self.staging_preview = false;
                     self.status = PipelineStatus::Error(format!("terminal image error: {error}"));
                 }
             }
@@ -626,6 +666,9 @@ impl App {
         let Some(page) = &self.full_page else {
             return;
         };
+        if self.preview_size.width == 0 || self.preview_size.height == 0 {
+            return;
+        }
         let font = self.picker.font_size();
         let viewport_height = u32::from(self.preview_size.height.max(1)) * u32::from(font.height);
         let viewport_height = viewport_height.max(1);
@@ -642,7 +685,11 @@ impl App {
         let protocol = self
             .picker
             .new_resize_protocol(DynamicImage::ImageRgba8(canvas));
-        self.image_state.replace_protocol(protocol);
+        self.staging_image.protocol.replace_protocol(protocol);
+        self.staging_image
+            .protocol
+            .resize_encode(&Resize::Fit(None), self.preview_size);
+        self.staging_preview = true;
     }
 
     fn scroll_preview(&mut self, rows: i16) {
@@ -831,7 +878,7 @@ impl App {
     }
 
     pub(crate) fn has_preview(&self) -> bool {
-        self.full_page.is_some()
+        self.preview_visible
     }
 
     pub(crate) fn preview_placeholder(&self) -> &'static str {
@@ -843,7 +890,7 @@ impl App {
     }
 
     pub(crate) fn image_state_mut(&mut self) -> &mut ThreadProtocol {
-        &mut self.image_state
+        &mut self.active_image.protocol
     }
 }
 
@@ -1000,6 +1047,17 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn wait_for_staged_preview(app: &mut App) {
+        for _ in 0..100 {
+            app.process_background_events();
+            if !app.staging_preview {
+                return;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        panic!("timed out waiting for terminal preview encoding");
+    }
+
     #[test]
     fn f6_cycles_focus_without_repurposing_tab() {
         let mut app = App::default();
@@ -1051,6 +1109,36 @@ mod tests {
 
         assert!(matches!(app.status, PipelineStatus::Empty));
         assert_eq!(app.submitted_revision, None);
+    }
+
+    #[test]
+    fn rendered_preview_stays_visible_while_replacement_is_encoded() {
+        let mut app = App {
+            preview_size: Size::new(20, 8),
+            full_page: Some(DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+                320,
+                240,
+                Rgba([255, 255, 255, 255]),
+            ))),
+            ..App::default()
+        };
+
+        app.install_visible_preview();
+        assert!(!app.has_preview());
+        wait_for_staged_preview(&mut app);
+        assert!(app.has_preview());
+
+        app.full_page = Some(DynamicImage::ImageRgba8(ImageBuffer::from_pixel(
+            320,
+            240,
+            Rgba([240, 240, 240, 255]),
+        )));
+        app.install_visible_preview();
+
+        assert!(app.staging_preview);
+        assert!(app.has_preview());
+        wait_for_staged_preview(&mut app);
+        assert!(app.has_preview());
     }
 
     #[test]
