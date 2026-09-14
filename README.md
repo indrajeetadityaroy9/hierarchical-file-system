@@ -14,7 +14,7 @@ cargo run
 
 ## Interface
 
-Mathnote uses Shiki's Cyberpunk 2077 palette and responsive Miller-column layout. Wide terminals show the source, generated LaTeX, and rendered document together. Narrow terminals stack the panes, while very small terminals and zen mode show only the focused pane.
+Wide terminals show the source, generated LaTeX, and rendered document together. Narrow terminals stack the panes, while very small terminals and zen mode show only the focused pane.
 
 - `F1`: command reference
 - `F2`: toggle distraction-free zen mode
