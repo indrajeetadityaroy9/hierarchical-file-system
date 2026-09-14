@@ -29,5 +29,3 @@ Mathnote uses Shiki's Cyberpunk 2077 palette and responsive Miller-column layout
 - Mouse wheel: scroll the pane under the pointer
 
 Compilation, document parsing, LaTeX generation, PDF rendering, and terminal image encoding are kept off the typing path. Work is debounced and revision checked, duplicate viewport encodes are skipped, and the current rendered page remains visible until its replacement is ready.
-
-The Cyberpunk palette, responsive layout conventions, contextual footer, mouse affordances, and zen-mode interaction were adapted from [sazardev/shiki](https://github.com/sazardev/shiki) at commit `051aab32c50f06db362c9e2085db245f19d04966`.
